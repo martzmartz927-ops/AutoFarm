@@ -1,0 +1,8103 @@
+-- AXION Multitool (MoonLoader)
+-- Раздел 1: ESP (Objects / Players)
+
+script_name('AXION')
+script_author('Niko')
+script_version('0.2')
+
+local imgui  = require('mimgui')
+local sampev = require('samp.events')
+local ffi    = require('ffi')
+
+local new = imgui.new
+local u8  = function(text) return text end
+
+------------------------------------------------------------
+-- ТАБЛИЦА ИГРОКОВ ИЗ СЕТЕВЫХ ПАКЕТОВ (100% надёжный способ,
+-- работает на CRMP/Arizona, где sampGetPlayerIdByCharHandle и
+-- sampGetCharHandleBySampPlayerId сломаны/крашат)
+------------------------------------------------------------
+-- ФИКС (важно): предыдущий подход пытался сопоставить playerId с ped-хэндлом
+-- через onPlayerStreamIn (позиция на момент появления в стриме) — но
+-- проверка показала, что onPlayerStreamIn почти не срабатывает на Arizona
+-- (join=547, in=24 — то есть только 24 из 547 игроков вообще получили
+-- стрим-ивент). Прямой опкод sampGetPlayerIdByCharHandle тоже не работает
+-- (подтверждено тестовой кнопкой — срабатывает только для своего PLAYER_PED).
+--
+-- Правильное решение: НЕ ИСКАТЬ ped-хэндл вообще. onPlayerSync (и
+-- onFootSync/onVehicleSync в некоторых версиях SAMP.Lua) шлёт playerId +
+-- реальную позицию + health НАПРЯМУЮ из сети, регулярно (каждые несколько
+-- тиков движения), а не один раз при появлении. Просто храним последнюю
+-- известную позицию и health для каждого playerId — этого достаточно для
+-- ESP, ped-хэндл не нужен вообще (координаты передаются серверу и так,
+-- используем их напрямую для world->screen).
+local samp_players = {} -- [playerId] = {nickname=, isNpc=, x=, y=, z=, health=, lastUpdate=}
+
+-- счётчики срабатывания событий с момента запуска скрипта — диагностика
+local event_stats = { playerJoinFired = 0, playerSyncFired = 0, footSyncFired = 0 }
+
+function sampev.onPlayerJoin(playerId, color, isNpc, nickname)
+    event_stats.playerJoinFired = event_stats.playerJoinFired + 1
+    samp_players[playerId] = samp_players[playerId] or {}
+    samp_players[playerId].nickname = nickname
+    samp_players[playerId].isNpc = isNpc
+end
+
+function sampev.onPlayerQuit(playerId, reason)
+    samp_players[playerId] = nil
+end
+
+-- Универсальный разборщик: на разных сборках SAMP.Lua/компат-профилях (например,
+-- ARZMOD на MonetLoader/Android) порядок и число аргументов в этих колбэках может
+-- отличаться от оригинальной THE-FYP/SAMP.Lua. Чтобы не зависеть от порядка,
+-- сами ищем среди переданных аргументов: playerId (число) и data (таблица).
+local function extract_id_and_data(...)
+    local n = select('#', ...)
+    local id, data
+    for i = 1, n do
+        local v = select(i, ...)
+        if type(v) == 'table' and not data then
+            data = v
+        elseif type(v) == 'number' and not id then
+            id = v
+        end
+    end
+    return id, data
+end
+
+-- ОСНОВНОЙ источник координат: приходит регулярно, пока игрок пеший.
+function sampev.onPlayerSync(...)
+    local playerId, data = extract_id_and_data(...)
+    if not playerId or not data then return end
+
+    event_stats.playerSyncFired = event_stats.playerSyncFired + 1
+    samp_players[playerId] = samp_players[playerId] or {}
+    local p = samp_players[playerId]
+    if data.position then
+        p.x, p.y, p.z = data.position.x, data.position.y, data.position.z
+    end
+    if data.health then p.health = data.health end
+    p.lastUpdate = os.clock()
+    p.inVehicle = false
+end
+
+-- Некоторые сборки SAMP.Lua называют это onFootSync вместо onPlayerSync —
+-- регистрируем оба на случай различий в версии библиотеки на этом сервере.
+if sampev.onFootSync == nil then
+    function sampev.onFootSync(...)
+        return sampev.onPlayerSync(...)
+    end
+end
+
+-- Пассажир/водитель в машине — синхронизация приходит другим пакетом,
+-- у него тоже есть position. Обрабатываем, чтобы не терять игроков в тачках.
+function sampev.onVehicleSync(...)
+    local n = select('#', ...)
+    local playerId, vehicleId, data
+    local numbersFound = 0
+    for i = 1, n do
+        local v = select(i, ...)
+        if type(v) == 'table' and not data then
+            data = v
+        elseif type(v) == 'number' then
+            numbersFound = numbersFound + 1
+            if numbersFound == 1 then playerId = v
+            elseif numbersFound == 2 then vehicleId = v end
+        end
+    end
+    if not playerId or not data then return end
+
+    samp_players[playerId] = samp_players[playerId] or {}
+    local p = samp_players[playerId]
+    if data.position then
+        p.x, p.y, p.z = data.position.x, data.position.y, data.position.z
+    end
+    if data.playerHealth then p.health = data.playerHealth end
+    if data.health then p.health = data.health end
+    p.vehicleId = vehicleId
+    p.lastUpdate = os.clock()
+    p.inVehicle = true
+end
+
+-- Через сколько секунд без обновления координат считаем данные игрока
+-- устаревшими (например, он вышел из зоны стрима или сменил интерьер)
+-- и не рисуем его, пока не придёт новое обновление.
+local STALE_TIMEOUT = 5.0
+
+------------------------------------------------------------
+-- ОКНО / СОСТОЯНИЕ
+------------------------------------------------------------
+
+local main_window_state = new.bool(false)
+
+-- активная вкладка верхнего уровня (пока только ESP, дальше будем добавлять)
+local active_section = 'ESP'
+
+-- активная под-вкладка внутри ESP
+local esp_subtab = 'OBJECTS'
+
+-- список разделов верхнего уровня
+local TOP_SECTIONS = { 'ESP', 'PLAYER', 'FPS', 'RENDERING', 'SETTINGS', 'INFO' }
+
+local ACCENT      = { 0.62, 0.35, 1.00 } -- фиолетовый акцент AXION
+local ROUNDING    = 10
+
+------------------------------------------------------------
+-- РАЗДЕЛ PLAYER: AUTO RECONNECT
+------------------------------------------------------------
+
+-- галочка включения авто-реконнекта (стрелка вниз открывает поле пароля)
+local player_autoreconnect_enabled = new.bool(false)
+-- буфер поля ввода пароля (скрытый ввод, как обычно у password-полей)
+local player_reconnect_password = new.char[64]('')
+-- собственный флаг, что мы сейчас именно отвалились от сервера (а не просто
+-- ещё не зашли) — чтобы не пытаться реконнектиться до первого успешного коннекта
+local player_was_connected_once = false
+-- защита от спама попыток реконнекта, если сервер недоступен
+local player_last_reconnect_attempt = 0
+local RECONNECT_RETRY_DELAY = 5.0 -- секунд между попытками
+
+------------------------------------------------------------
+-- РАЗДЕЛ PLAYER: FREE CAM
+------------------------------------------------------------
+
+local player_freecam_enabled = new.bool(false)
+-- сохранённая позиция игрока на момент включения FreeCam (персонаж "замирает" тут)
+local freecam_frozen_pos = nil
+-- текущая позиция свободной камеры (независимая от персонажа)
+local freecam_pos = { x = 0, y = 0, z = 0 }
+-- текущие углы направления камеры (градусы): yaw — поворот вокруг Z (куда
+-- смотрим по горизонтали), pitch — наклон вверх/вниз
+local freecam_yaw, freecam_pitch = 0, 0
+-- какие направления сейчас "зажаты" — выставляются кнопками в UI (мобильный
+-- телефон не имеет физических клавиш WASD, поэтому используем кнопки на экране)
+local freecam_move_dir = { forward = false, back = false, left = false, right = false, up = false, down = false }
+-- виртуальный джойстик (x,y в диапазоне [-1..1]), управляется через UI-стик
+-- ниже; используется и Free Cam, и No Clip
+local freecam_stick = { x = 0, y = 0 }
+-- общее вертикальное направление полёта (1=вверх, -1=вниз, 0=ничего),
+-- выставляется плавающим джойстиком (полоса свайпа справа от круга) и
+-- читается всеми тремя потоками полёта: Free Cam, No Clip, Jetpack
+local flight_vertical_dir = 0
+local freecam_fast_mode = false
+local FREECAM_MOVE_SPEED = 0.5    -- игровых единиц за тик
+local FREECAM_FAST_MULT  = 3.0    -- множитель ускоренного полёта
+
+------------------------------------------------------------
+-- РАЗДЕЛ PLAYER: GOD MODE (неуязвимость)
+------------------------------------------------------------
+-- полная защита персонажа от урона: пуль, падений, огня, воды, взрывов,
+-- коллизий — пока включено, здоровье и броня держатся на максимуме
+local player_godmode_enabled = new.bool(false)
+
+------------------------------------------------------------
+-- РАЗДЕЛ PLAYER: TELEPORT TO WAYPOINT
+------------------------------------------------------------
+-- мгновенный телепорт персонажа к точке, отмеченной маркером (waypoint)
+-- на игровой карте — работает как обычный маркер GPS, просто ставите
+-- точку на карте и жмёте кнопку
+local teleport_last_status = ''
+local teleport_waypoint_request = nil -- {x, y, z} либо nil
+
+-- Мгновенный скачок координат, но с попыткой скрыть сам факт скачка от
+-- сервера: на короткое время приостанавливаем отправку пакетов позиции
+-- (sampSetSendPacketsState), делаем прыжок, ждём немного и возобновляем
+-- синхронизацию — сервер получает уже новую точку, без промежуточных
+-- координат полёта.
+--
+-- ВАЖНО: это снижает риск детекта "по скорости/траектории движения", но
+-- НЕ гарантирует защиту от детекта "по расстоянию между двумя соседними
+-- принятыми позициями" — если анти-чит сверяет абсолютную дистанцию между
+-- последней известной серверу точкой и новой, скачок всё равно будет виден
+-- в момент возобновления синка. 100%-й гарантии от кика нет.
+--
+-- sampSetSendPacketsState — стандартная функция SAMP.Lua/MoonLoader для
+-- управления отправкой исходящих пакетов; оборачиваем в pcall на случай,
+-- если конкретная сборка её не поддерживает — тогда просто выполняем
+-- обычный мгновенный телепорт без сокрытия.
+local TELEPORT_HIDE_PAUSE_MS = 300 -- насколько приостанавливаем синк вокруг прыжка
+
+local function teleport_in_jumps(px, py, pz, tx, ty, tz)
+    local okPauseOff = pcall(sampSetSendPacketsState, false)
+
+    pcall(setCharCoordinates, PLAYER_PED, tx, ty, tz)
+    wait(TELEPORT_HIDE_PAUSE_MS)
+
+    if okPauseOff then
+        pcall(sampSetSendPacketsState, true)
+    end
+end
+
+lua_thread.create(function()
+    while true do
+        wait(0)
+        if teleport_waypoint_request then
+            local target = teleport_waypoint_request
+            teleport_waypoint_request = nil
+
+            local bx, by, bz = target.x, target.y, target.z
+            pcall(requestCollision, bx, by)
+            pcall(loadScene, bx, by, bz)
+
+            local finalZ = bz
+            local okGz, gz = pcall(getGroundZFor3dCoord, bx, by, bz + 5)
+            if okGz and type(gz) == 'number' and gz > -100 then
+                finalZ = gz + 1.0
+            end
+
+            local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+            if okP and type(px) == 'number' then
+                teleport_in_jumps(px, py, pz, bx, by, finalZ)
+                teleport_last_status = u8'Телепорт выполнен.'
+            else
+                teleport_last_status = u8'Не удалось телепортироваться.'
+            end
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- РАЗДЕЛ PLAYER: SPEED HACK
+------------------------------------------------------------
+-- ускоряет передвижение персонажа пешком и за рулём, изменяя игровой
+-- множитель скорости анимации/симуляции движения
+local player_speedhack_enabled = new.bool(false)
+local player_speedhack_mult = new.float(2.0) -- 1.0 = обычная скорость
+
+------------------------------------------------------------
+-- РАЗДЕЛ PLAYER: TELEPORT TO PLAYER
+------------------------------------------------------------
+-- мгновенный телепорт к любому онлайн-игроку по его SAMP ID
+local teleport_player_id = new.int(0)
+local teleport_player_status = ''
+
+------------------------------------------------------------
+-- РАЗДЕЛ PLAYER: NO CLIP
+------------------------------------------------------------
+-- персонаж двигается сквозь стены/объекты пешком (не только камера, как во
+-- Free Cam) — использует тот же виртуальный джойстик, что и Free Cam
+local player_noclip_enabled = new.bool(false)
+local noclip_pos = { x = 0, y = 0, z = 0 }
+local noclip_stick = { x = 0, y = 0 }
+local noclip_move_up, noclip_move_down = false, false
+local NOCLIP_MOVE_SPEED = 0.35
+local NOCLIP_FAST_MULT  = 3.0
+local noclip_fast_mode = false
+
+------------------------------------------------------------
+-- РАЗДЕЛ PLAYER: JETPACK
+------------------------------------------------------------
+-- реактивный ранец: персонаж реально летает с видимой анимацией парения
+-- (в отличие от No Clip, тут используется стандартная игровая задача
+-- TASK_SIMPLE_JETPACK) и управляется тем же виртуальным джойстиком
+local player_jetpack_enabled = new.bool(false)
+local jetpack_stick = { x = 0, y = 0 }
+local JETPACK_MOVE_SPEED = 0.30
+local JETPACK_FAST_MULT  = 3.0
+local jetpack_fast_mode = false
+
+------------------------------------------------------------
+-- РАЗДЕЛ PLAYER: INFINITE SPRINT
+------------------------------------------------------------
+-- бесконечная выносливость: персонаж может бежать без остановки, не устаёт
+local player_infinitesprint_enabled = new.bool(false)
+
+------------------------------------------------------------
+-- ESP: OBJECTS -- настройки
+------------------------------------------------------------
+
+local esp_enabled       = new.bool(true)
+local esp_lines_enabled = new.bool(true)
+local esp_dot_enabled   = new.bool(true)
+
+local esp_distance   = new.float(50.0)
+local esp_lines_size = new.float(1.5)
+
+-- цвет линий (RGBA 0..1)
+local esp_lines_color = new.float[4](0.65, 0.30, 1.00, 1.00)
+
+-- список объектов для ESP: { model = number, name = string|nil }
+local esp_objects_list = {}
+
+-- поля ввода для добавления нового объекта
+local new_object_model = new.char[16]('')
+local new_object_name  = new.char[32]('')
+
+-- кэш объектов в радиусе, обновляется отдельным потоком (не в кадре отрисовки)
+local esp_object_cache  = {}
+local esp_players_cache = {}
+local esp_cars_cache    = {}
+
+------------------------------------------------------------
+-- ESP: PLAYERS -- настройки (визуал, логика позже)
+------------------------------------------------------------
+
+local esp_players_enabled       = new.bool(true)
+local esp_players_lines_enabled = new.bool(true)
+local esp_players_box_enabled   = new.bool(true)
+local esp_players_distance      = new.float(100.0)
+local esp_players_lines_size    = new.float(1.5)
+local esp_players_color         = new.float[4](0.30, 0.80, 1.00, 1.00)
+
+-- флаг: вывести один раз отладочную статистику по ESP игроков в чат
+local esp_players_debug = false
+-- флаг: полностью отключить проверку игрок/NPC, рисовать всех getAllChars()
+local esp_players_nofilter = new.bool(false)
+
+------------------------------------------------------------
+-- ESP: CARS -- настройки (визуал, логика позже)
+------------------------------------------------------------
+
+local esp_cars_enabled       = new.bool(true)
+local esp_cars_lines_enabled = new.bool(true)
+local esp_cars_box_enabled   = new.bool(true)
+local esp_cars_distance      = new.float(100.0)
+local esp_cars_lines_size    = new.float(1.5)
+local esp_cars_color         = new.float[4](1.00, 0.70, 0.20, 1.00)
+
+-- поля ввода для добавления модели авто в список ESP (аналогично объектам)
+local new_car_model = new.char[16]('')
+local new_car_name  = new.char[32]('')
+local esp_cars_list = {}
+
+------------------------------------------------------------
+-- ВСПОМОГАТЕЛЬНОЕ
+------------------------------------------------------------
+
+local function bufToStr(buf, maxlen)
+    local ok, s = pcall(ffi.string, buf, maxlen)
+    if not ok then return '' end
+    -- обрезаем по первому нулевому байту
+    local z = s:find('\0')
+    return z and s:sub(1, z - 1) or s
+end
+
+------------------------------------------------------------
+-- AUTO RECONNECT: авто-ввод пароля при появлении диалога авторизации
+------------------------------------------------------------
+
+function sampev.onShowDialog(id, style, title, button1, button2, text)
+    if not player_autoreconnect_enabled[0] then return end
+
+    local pass_str = bufToStr(player_reconnect_password, 64)
+    if pass_str == '' then return end
+
+    -- ищем диалог авторизации по ключевым словам в заголовке/тексте —
+    -- разные RP-серверы называют его по-разному, поэтому проверяем оба поля.
+    local haystack = (tostring(title or '') .. ' ' .. tostring(text or '')):lower()
+    local looks_like_auth =
+        haystack:find('автори') or haystack:find('парол') or
+        haystack:find('password') or haystack:find('login') or
+        haystack:find('вход в аккаунт')
+
+    if looks_like_auth then
+        sampSendDialogResponse(id, 1, 65535, pass_str)
+    end
+end
+
+local function add_object_to_list()
+    local model_str = bufToStr(new_object_model, 16)
+    local model_num = tonumber(model_str)
+    if not model_num then return end -- некорректный ввод, ничего не делаем
+
+    local name_str = bufToStr(new_object_name, 32)
+    if name_str == '' then name_str = nil end
+
+    table.insert(esp_objects_list, { model = math.floor(model_num), name = name_str })
+
+    -- очищаем поля ввода после добавления
+    new_object_model[0] = 0
+    new_object_name[0] = 0
+end
+
+local function remove_object_from_list(index)
+    table.remove(esp_objects_list, index)
+end
+
+-- есть ли modelId в списке ESP-объектов
+local function is_esp_model(model)
+    for _, v in ipairs(esp_objects_list) do
+        if v.model == model then return true end
+    end
+    return false
+end
+
+------------------------------------------------------------
+-- ФОНОВЫЙ ПОТОК: сбор объектов в радиусе (не в кадре отрисовки)
+------------------------------------------------------------
+
+lua_thread.create(function()
+    while true do
+        wait(300)
+
+        if esp_enabled[0] and #esp_objects_list > 0 then
+            local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+            if okP and type(px) == 'number' then
+                local radius = esp_distance[0]
+                local tmp = {}
+
+                local okObjs, objs = pcall(getAllObjects)
+                if okObjs and objs then
+                    for _, handle in ipairs(objs) do
+                        local okModel, model = pcall(getObjectModel, handle)
+                        if okModel and model and is_esp_model(model) then
+                            local okCoord, _, ox, oy, oz = pcall(getObjectCoordinates, handle)
+                            if okCoord and type(ox) == 'number' then
+                                local dist = getDistanceBetweenCoords3d(px, py, pz, ox, oy, oz)
+                                if dist <= radius then
+                                    tmp[#tmp + 1] = { handle = handle, x = ox, y = oy, z = oz, dist = dist }
+                                end
+                            end
+                        end
+                    end
+                end
+
+                esp_object_cache = tmp
+            end
+        else
+            esp_object_cache = {}
+        end
+    end
+end)
+
+-- Поток: игроки
+lua_thread.create(function()
+    while true do
+        wait(300)
+        if esp_players_enabled[0] then
+            local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+            if okP and type(px) == 'number' then
+                local radius = esp_players_distance[0]
+                local tmp = {}
+
+                local dbgFound = 0
+
+                if esp_players_nofilter[0] then
+                    -- РЕЖИМ БЕЗ ФИЛЬТРА: никакой проверки игрок/NPC, просто все
+                    -- существующие персонажи в радиусе. Нужен только чтобы
+                    -- подтвердить, что сама отрисовка (world->screen) работает.
+                    local allChars = getAllChars()
+                    if allChars then
+                        for _, ped in ipairs(allChars) do
+                            if ped and ped ~= PLAYER_PED and doesCharExist(ped) then
+                                local cx, cy, cz = getCharCoordinates(ped)
+                                if cx then
+                                    local dist = getDistanceBetweenCoords3d(px, py, pz, cx, cy, cz)
+                                    if dist <= radius then
+                                        dbgFound = dbgFound + 1
+                                        tmp[#tmp + 1] = {
+                                            x = cx, y = cy, z = cz, dist = dist,
+                                            name = 'CHAR#' .. tostring(ped)
+                                        }
+                                    end
+                                end
+                            end
+                        end
+                    end
+
+                    if esp_players_debug then
+                        esp_players_debug = false
+                        sampAddChatMessage(string.format(
+                            '{AA88FF}[AXION DEBUG NOFILTER] chars=%d found=%d',
+                            allChars and #allChars or 0, dbgFound), -1)
+                    end
+
+                else
+                    -- ОСНОВНОЙ РЕЖИМ: читаем координаты напрямую из сетевых
+                    -- пакетов (onPlayerSync/onVehicleSync), без поиска
+                    -- ped-хэндла вообще. Это надёжно независимо от того,
+                    -- работают ли на сервере опкоды ped<->id (подтверждено:
+                    -- не работают) и независимо от частоты стрим-событий
+                    -- (тоже подтверждено: onPlayerStreamIn почти не летит).
+                    local now = os.clock()
+                    local dbgTotal, dbgNpc, dbgStale, dbgNoPos = 0, 0, 0, 0
+
+                    for pid, p in pairs(samp_players) do
+                        dbgTotal = dbgTotal + 1
+                        if p.isNpc then
+                            dbgNpc = dbgNpc + 1
+                        elseif not p.x then
+                            dbgNoPos = dbgNoPos + 1
+                        elseif p.lastUpdate and (now - p.lastUpdate) > STALE_TIMEOUT then
+                            dbgStale = dbgStale + 1
+                        else
+                            local dist = getDistanceBetweenCoords3d(px, py, pz, p.x, p.y, p.z)
+                            if dist <= radius then
+                                dbgFound = dbgFound + 1
+                                tmp[#tmp + 1] = {
+                                    x = p.x, y = p.y, z = p.z, dist = dist,
+                                    hp = p.health,
+                                    name = p.nickname or ('ID:' .. tostring(pid))
+                                }
+                            end
+                        end
+                    end
+
+                    if esp_players_debug then
+                        esp_players_debug = false
+                        sampAddChatMessage(string.format(
+                            '{AA88FF}[AXION DEBUG] total=%d found=%d npc=%d no_pos=%d stale=%d | events: join=%d sync=%d',
+                            dbgTotal, dbgFound, dbgNpc, dbgNoPos, dbgStale,
+                            event_stats.playerJoinFired, event_stats.playerSyncFired), -1)
+                    end
+                end
+
+                esp_players_cache = tmp
+            end
+        else
+            esp_players_cache = {}
+        end
+    end
+end)
+
+-- Поток: машины
+lua_thread.create(function()
+    while true do
+        wait(300)
+        if esp_cars_enabled[0] then
+            local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+            if okP and type(px) == 'number' then
+                local radius = esp_cars_distance[0]
+                local tmp = {}
+                local okVehs, vehs = pcall(getAllVehicles)
+                if okVehs and vehs then
+                    for _, veh in ipairs(vehs) do
+                        local okC, vx, vy, vz = pcall(getCarCoordinates, veh)
+                        if okC and type(vx) == 'number' then
+                            local dist = getDistanceBetweenCoords3d(px, py, pz, vx, vy, vz)
+                            if dist <= radius then
+                                local okM, model = pcall(getCarModel, veh)
+                                -- показываем машину только если её модель явно добавлена
+                                -- в список (пустой список = ничего не показываем, а не всё подряд)
+                                local show = false
+                                if okM then
+                                    for _, c in ipairs(esp_cars_list) do
+                                        if c.model == model then show = true; break end
+                                    end
+                                end
+                                if show then
+                                    tmp[#tmp + 1] = { x = vx, y = vy, z = vz, dist = dist }
+                                end
+                            end
+                        end
+                    end
+                end
+                esp_cars_cache = tmp
+            end
+        else
+            esp_cars_cache = {}
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- ПОТОК: AUTO RECONNECT
+------------------------------------------------------------
+-- Следит, подключены ли мы к серверу. Если авто-реконнект включён и мы были
+-- подключены хотя бы раз, а потом соединение пропало — эмулируем настоящий
+-- обрыв связи через низкоуровневые raknet-пакеты (именно так это надёжно
+-- работает на MonetLoader for Android — sampConnectToServer там ненадёжен).
+-- Пароль вводится автоматически через onShowDialog, когда сервер покажет
+-- диалог авторизации после того, как игра сама переподключится.
+local sf_ok, sf = pcall(require, 'sampfuncs')
+if not sf_ok and sampAddChatMessage then
+    pcall(sampAddChatMessage, '{FF6347}[AXION] AUTO RECONNECT: модуль sampfuncs не найден, функция не будет работать.', -1)
+end
+
+local function do_reconnect_sequence()
+    lua_thread.create(function()
+        if not sf_ok or not sf then return end
+
+        -- сначала аккуратно уведомляем сервер об отключении,
+        -- затем эмулируем разрыв соединения — это заставляет клиент сам
+        -- инициировать переподключение к последнему серверу (как при обычном
+        -- обрыве интернета), включая повторный показ диалога авторизации.
+        local okBs1, bs1 = pcall(raknetNewBitStream)
+        if okBs1 and bs1 then
+            pcall(raknetBitStreamWriteInt8, bs1, sf.PACKET_DISCONNECTION_NOTIFICATION)
+            pcall(raknetSendBitStreamEx, bs1, sf.SYSTEM_PRIORITY, sf.RELIABLE, 0)
+            pcall(raknetDeleteBitStream, bs1)
+        end
+
+        wait(500)
+
+        local okBs2, bs2 = pcall(raknetNewBitStream)
+        if okBs2 and bs2 then
+            pcall(raknetEmulPacketReceiveBitStream, sf.PACKET_CONNECTION_LOST, bs2)
+            pcall(raknetDeleteBitStream, bs2)
+        end
+    end)
+end
+
+lua_thread.create(function()
+    while true do
+        wait(500)
+
+        local okAvail, available = pcall(isSampAvailable)
+        local currentlyConnected = okAvail and available
+
+        if currentlyConnected then
+            player_was_connected_once = true
+        elseif player_autoreconnect_enabled[0] and player_was_connected_once then
+            local now = os.clock()
+            if now - player_last_reconnect_attempt >= RECONNECT_RETRY_DELAY then
+                player_last_reconnect_attempt = now
+                do_reconnect_sequence()
+            end
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- ПОТОК: GOD MODE
+------------------------------------------------------------
+-- ВАЖНО: setCharProofs/setCharHealth — чисто клиентские трюки. Они не
+-- дают эффекта на сервере: сервер сам считает урон и здоровье персонажа
+-- на своей стороне, поэтому такой годмод визуально держит 100 HP на
+-- экране, но по факту не защищает — сервер может убить/кикнуть, т.к.
+-- со своей стороны видит реальные повреждения.
+--
+-- Рабочий способ (взят из проверенного стороннего скрипта для Arizona):
+-- когда здоровье падает — эмулируем клик по серверному textdraw 632
+-- (легитимная логика на стороне сервера, реагирующая на этот клик так,
+-- как обычно реагирует на предусмотренное разработчиками действие).
+-- Дополнительно блокируем спец-действие смерти/падения и подменяем
+-- анимацию падения на "руки вверх", чтобы не было визуального рэгдолла.
+lua_thread.create(function()
+    while true do
+        wait(0)
+        if player_godmode_enabled[0] then
+            local okHp, hp = pcall(getCharHealth, PLAYER_PED)
+            if okHp and type(hp) == 'number' and hp < 90 and hp > 5 then
+                pcall(sampSendClickTextdraw, 632)
+                wait(0)
+            end
+        end
+    end
+end)
+
+-- блокируем спец-действие (используется для падений/смерти на некоторых серверах)
+if sampev then
+    function sampev.onSetPlayerSpecialAction(action)
+        if player_godmode_enabled[0] and action == 0 then
+            return false
+        end
+    end
+
+    -- если сервер присылает игровой текст со штрафом (например, "-20$"),
+    -- пока активен годмод — не показываем его, это сопутствует урону
+    function sampev.onDisplayGameText(style, time, text)
+        if player_godmode_enabled[0] and type(text) == 'string' and text:find('%-20%$') then
+            return false
+        end
+    end
+
+    -- анимация падения/смерти подменяется на "руки вверх", чтобы не было
+    -- визуального рэгдолла, пока активен годмод
+    function sampev.onApplyPlayerAnimation(playerId, animLib, animName)
+        if not player_godmode_enabled[0] then return end
+        local okMy, myId = pcall(sampGetPlayerIdByCharHandle, PLAYER_PED)
+        if okMy and playerId == myId then
+            local okAnimId, animId = pcall(sampFindAnimationIdByNameAndFile, animName, animLib)
+            if okAnimId and animId == 1658 then
+                pcall(taskPlayAnim, PLAYER_PED, 'HANDSUP', 'PED', 1.0, false, false, false, false, 1)
+            end
+        end
+    end
+end
+
+------------------------------------------------------------
+-- ПОТОК: SPEED HACK
+------------------------------------------------------------
+-- Ускоряем скорость проигрывания анимаций ходьбы/бега/спринта напрямую —
+-- этот способ не зависит от коллизии/трения текущей поверхности (асфальт,
+-- трава, песок, уклон), в отличие от инжекта через setCharVelocity, который
+-- на некоторых поверхностях гасится физическим движком раньше, чем успевает
+-- подействовать (эффект "то тормозит, то без разницы").
+-- За рулём анимации не участвуют в скорости движения — там ускоряем как раньше.
+local SPEEDHACK_ANIMS = {
+    'walk_player', 'walk_civi', 'walk_armed', 'walk_fat', 'walk_old', 'walk_fatold',
+    'walk_gang1', 'walk_gang2', 'walk_drunk', 'walk_wuzi', 'walk_csaw', 'walk_rocket',
+    'run_player', 'run_civi', 'run_armed', 'run_fat', 'run_fatold', 'run_old',
+    'run_gang1', 'run_wuzi', 'run_csaw', 'run_rocket', 'run_1armed', 'run_left', 'run_right',
+    'sprint_civi', 'sprint_panic', 'sprint_wuzi', 'swat_run',
+    'woman_walknorm', 'woman_walkbusy', 'woman_walkpro', 'woman_walksexy',
+    'woman_walkshop', 'woman_walkfatold', 'woman_walkold',
+    'woman_run', 'woman_runbusy', 'woman_runfatold', 'woman_runpanic', 'woman_runsexy',
+    'jog_malea', 'jog_femalea',
+}
+
+local SPEEDHACK_MAX_STEP = 0.6 -- максимальное доп. смещение за один тик (для транспорта, как раньше)
+
+lua_thread.create(function()
+    local prev_pos = nil
+    local anims_applied = false
+
+    while true do
+        wait(0)
+
+        local okVeh, veh = pcall(getCharVehicle, PLAYER_PED)
+        local inVehicle = okVeh and veh and veh ~= 0
+
+        if player_speedhack_enabled[0] then
+            if not inVehicle then
+                -- пешком: ускоряем анимации напрямую, каждый кадр (значение
+                -- может быть изменено ползунком "на лету")
+                local mult = player_speedhack_mult[0]
+                for _, anim in ipairs(SPEEDHACK_ANIMS) do
+                    pcall(setCharAnimSpeed, PLAYER_PED, anim, mult)
+                end
+                anims_applied = true
+            else
+                -- за рулём анимации ни при чём — используем прежний подход
+                -- через усиление реального смещения между кадрами
+                local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+                if okP and type(px) == 'number' then
+                    if prev_pos then
+                        local dx, dy = px - prev_pos.x, py - prev_pos.y
+                        local horizDist = math.sqrt(dx*dx + dy*dy)
+                        if horizDist > 0.005 and horizDist < 2.0 then
+                            local mult = player_speedhack_mult[0]
+                            local addDist = horizDist * mult
+                            if addDist > SPEEDHACK_MAX_STEP then
+                                addDist = SPEEDHACK_MAX_STEP
+                            end
+                            local nx = dx / horizDist * addDist
+                            local ny = dy / horizDist * addDist
+                            local vz = 0
+                            local okVel, vvx, vvy, vvz = pcall(getCharVelocity, PLAYER_PED)
+                            if okVel and type(vvz) == 'number' then vz = vvz end
+                            pcall(setCharVelocity, PLAYER_PED, nx, ny, vz)
+                        end
+                    end
+                    prev_pos = { x = px, y = py }
+                end
+            end
+        else
+            if anims_applied then
+                -- возвращаем анимациям обычную скорость при выключении
+                for _, anim in ipairs(SPEEDHACK_ANIMS) do
+                    pcall(setCharAnimSpeed, PLAYER_PED, anim, 1.0)
+                end
+                anims_applied = false
+            end
+            prev_pos = nil
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- ПОТОК: TELEPORT TO PLAYER
+------------------------------------------------------------
+-- телепорт к другому онлайн-игроку по SAMP ID; использует ту же надёжную
+-- связку getAllChars + sampGetPlayerIdByCharHandle, подтверждённую рабочей
+-- в ESP игроков ранее.
+--
+-- ВАЖНО: раньше эта функция вызывалась напрямую из клика кнопки внутри
+-- imgui.OnFrame и содержала wait(100) — это запрещено (UI-кадр не является
+-- корутиной lua_thread) и стабильно роняло скрипт ("Action crashed").
+-- Теперь кнопка только ставит флаг-запрос (teleport_player_request), а сам
+-- телепорт с wait() выполняется в отдельном lua_thread ниже.
+--
+-- Кроме того, мгновенный прыжок координат (setCharCoordinates за один тик)
+-- на сотни метров — то, что чаще всего ловит анти-чит сервера как
+-- невозможное перемещение и кикает. Поэтому телепорт выполняется плавным
+-- "долётом" мелкими шагами, как и телепорт к метке.
+local teleport_player_request = nil -- SAMP id игрока либо nil
+
+local function resolve_player_target_coords(target_id)
+    local p = samp_players[target_id]
+    if p and p.x and not p.isNpc then
+        local name = p.nickname or ('ID:' .. tostring(target_id))
+        return p.x, p.y, p.z, name
+    end
+
+    -- если синк ещё не пришёл (игрок давно стоит) — пробуем через getAllChars как fallback
+    local okAll, allChars = pcall(getAllChars)
+    if okAll and allChars then
+        for _, ped in ipairs(allChars) do
+            if ped and ped ~= PLAYER_PED then
+                local okId, isPlayer, sampId = pcall(sampGetPlayerIdByCharHandle, ped)
+                if okId and isPlayer and sampId == target_id then
+                    local okC, tx, ty, tz = pcall(getCharCoordinates, ped)
+                    if okC and type(tx) == 'number' then
+                        return tx, ty, tz, ('ID:' .. tostring(target_id))
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+lua_thread.create(function()
+    while true do
+        wait(0)
+        if teleport_player_request ~= nil then
+            local target_id = teleport_player_request
+            teleport_player_request = nil
+
+            local tx, ty, tz, name = resolve_player_target_coords(target_id)
+            if not tx then
+                teleport_player_status = u8'Игрок не найден.'
+            else
+                pcall(requestCollision, tx, ty)
+                pcall(loadScene, tx, ty, tz)
+
+                local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+                if okP and type(px) == 'number' then
+                    teleport_in_jumps(px, py, pz, tx, ty, tz + 0.5)
+                    teleport_player_status = u8('Телепорт к ' .. name .. ' выполнен.')
+                else
+                    teleport_player_status = u8'Не удалось телепортироваться.'
+                end
+            end
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- ПОТОК: NO CLIP
+------------------------------------------------------------
+-- Персонаж (не только камера) двигается сквозь любые препятствия, используя
+-- СОБСТВЕННЫЙ виртуальный джойстик (noclip_stick) и свои кнопки высоты —
+-- отдельные от Free Cam/Jetpack, чтобы функции не путали друг друга.
+lua_thread.create(function()
+    local was_enabled = false
+    while true do
+        wait(0)
+
+        if player_noclip_enabled[0] then
+            local okExistNC, existsNC = pcall(doesCharExist, PLAYER_PED)
+            if not okExistNC or not existsNC then
+                -- персонаж временно не существует (респавн/загрузка) — просто
+                -- ждём следующего кадра, не трогаем координаты
+                goto noclip_continue
+            end
+
+            if not was_enabled then
+                local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+                if okP and type(px) == 'number' then
+                    noclip_pos.x, noclip_pos.y, noclip_pos.z = px, py, pz
+                end
+                pcall(setCharProofs, PLAYER_PED, true, true, true, true, true)
+                was_enabled = true
+            end
+
+            -- направление — по направлению текущей игровой камеры (свайп-поворот),
+            -- только горизонтальная составляющая (без Z, чтобы не создавать
+            -- паразитный подъём/спуск при наклоне камеры вверх-вниз)
+            local okFwd, camFx, camFy = pcall(getActiveCameraPointAt)
+            local okCamPos, camPx, camPy = pcall(getActiveCameraCoordinates)
+            local fwdX, fwdY = 0, 1
+            if okFwd and camFx and okCamPos and camPx then
+                local dx, dy = camFx - camPx, camFy - camPy
+                local len = math.sqrt(dx*dx + dy*dy)
+                if len > 0 then fwdX, fwdY = dx/len, dy/len end
+            end
+            local rightX, rightY = fwdY, -fwdX
+
+            local jx, jy = noclip_stick.x, noclip_stick.y
+            local speed = NOCLIP_MOVE_SPEED
+            if noclip_fast_mode then speed = speed * NOCLIP_FAST_MULT end
+
+            noclip_pos.x = noclip_pos.x + (fwdX * (-jy) + rightX * jx) * speed
+            noclip_pos.y = noclip_pos.y + (fwdY * (-jy) + rightY * jx) * speed
+
+            if flight_vertical_dir ~= 0 then
+                noclip_pos.z = noclip_pos.z + flight_vertical_dir * speed
+            end
+
+            pcall(setCharCoordinates, PLAYER_PED, noclip_pos.x, noclip_pos.y, noclip_pos.z)
+        else
+            if was_enabled then
+                pcall(setCharProofs, PLAYER_PED, false, false, false, false, false)
+                was_enabled = false
+            end
+        end
+        ::noclip_continue::
+    end
+end)
+
+------------------------------------------------------------
+-- ПОТОК: JETPACK
+------------------------------------------------------------
+-- Реактивный ранец: персонаж реально летает, управляется собственным
+-- виртуальным джойстиком (свой, отдельный от Free Cam/No Clip, чтобы не
+-- было залипаний общих кнопок между функциями). Горизонталь — джойстик,
+-- высота — отдельные кнопки ВВЕРХ/ВНИЗ прямо в блоке Jetpack.
+local jetpack_move_up, jetpack_move_down = false, false
+
+lua_thread.create(function()
+    local was_enabled = false
+    local jetpack_pos = { x = 0, y = 0, z = 0 }
+
+    while true do
+        wait(0)
+
+        if player_jetpack_enabled[0] then
+            local okExistJp, existsJp = pcall(doesCharExist, PLAYER_PED)
+            if okExistJp and existsJp then
+                if not was_enabled then
+                    local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+                    if okP and type(px) == 'number' then
+                        jetpack_pos.x, jetpack_pos.y, jetpack_pos.z = px, py, pz
+                    end
+                    was_enabled = true
+                end
+
+                local okFwd, camFx, camFy, camFz = pcall(getActiveCameraPointAt)
+                local okCamPos, camPx, camPy, camPz = pcall(getActiveCameraCoordinates)
+                local fwdX, fwdY = 0, 1
+                if okFwd and camFx and okCamPos and camPx then
+                    local dx, dy = camFx - camPx, camFy - camPy
+                    local len = math.sqrt(dx*dx + dy*dy)
+                    if len > 0 then fwdX, fwdY = dx/len, dy/len end
+                end
+                local rightX, rightY = fwdY, -fwdX
+
+                local jx, jy = jetpack_stick.x, jetpack_stick.y
+                local speed = JETPACK_MOVE_SPEED
+                if jetpack_fast_mode then speed = speed * JETPACK_FAST_MULT end
+
+                -- считаем целевое смещение ОТ текущей internal-позиции
+                -- (jetpack_pos), а не перечитываем getCharCoordinates в этом
+                -- же кадре — иначе накапливается ошибка, т.к. игра ещё не
+                -- успела физически применить предыдущий setCharCoordinates
+                jetpack_pos.x = jetpack_pos.x + (fwdX * (-jy) + rightX * jx) * speed
+                jetpack_pos.y = jetpack_pos.y + (fwdY * (-jy) + rightY * jx) * speed
+
+                if flight_vertical_dir ~= 0 then
+                    jetpack_pos.z = jetpack_pos.z + flight_vertical_dir * speed
+                end
+                -- без ввода по вертикали — просто парим на текущей высоте,
+                -- НЕ трогаем Z вообще (никаких перечитываний координат здесь)
+
+                pcall(setCharCoordinates, PLAYER_PED, jetpack_pos.x, jetpack_pos.y, jetpack_pos.z)
+                pcall(setCharProofs, PLAYER_PED, false, false, false, false, true) -- защита только от падения
+            end
+        elseif was_enabled then
+            pcall(setCharProofs, PLAYER_PED, false, false, false, false, false)
+            was_enabled = false
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- РАЗДЕЛ RENDERING: HIDE PLAYERS (для FPS)
+------------------------------------------------------------
+-- ПЕРЕДЕЛАНО: старая версия использовала sampGetCharHandleBySampPlayerId для
+-- поиска ped-хэндла по id — этот опкод на Arizona/Android (ARZMOD/MonetLoader)
+-- сломан и всегда возвращает false (см. диагностику ESP выше: join=642,
+-- но ни один char handle через этот опкод не находится). Именно поэтому
+-- HIDE PLAYERS не работал вообще.
+--
+-- НОВЫЙ подход: id вообще не нужен. Берём хэндлы напрямую из getAllChars()
+-- (это работает стабильно — на нём построен весь ESP) и переключаем
+-- видимость/коллизию прямо на ped-хэндле: setCharVisible + setCharCollision.
+-- Это не полный стрим-аут (движок всё ещё знает о персонаже), но даёт
+-- заметный прирост FPS за счёт отключения отрисовки и физики коллизий,
+-- и, в отличие от RPC-эмуляции, гарантированно работает и полностью
+-- обратимо без реконнекта.
+local render_hide_players_enabled = new.bool(false)
+local hidden_players_peds = {} -- [ped] = true, если сейчас скрыт
+
+lua_thread.create(function()
+    while true do
+        wait(300) -- толпа не меняется мгновенно, каждый кадр проверять незачем
+        if render_hide_players_enabled[0] then
+            local okAll, allChars = pcall(getAllChars)
+            if okAll and allChars then
+                local seen = {}
+                for _, ped in ipairs(allChars) do
+                    if ped and ped ~= PLAYER_PED then
+                        local okExist, exists = pcall(doesCharExist, ped)
+                        if okExist and exists then
+                            seen[ped] = true
+                            if not hidden_players_peds[ped] then
+                                pcall(setCharVisible, ped, false)
+                                pcall(setCharCollision, ped, false)
+                                hidden_players_peds[ped] = true
+                            end
+                        end
+                    end
+                end
+                -- чистим записи о ped'ах, которые перестали существовать
+                -- (иначе таблица растёт бесконечно при смене состава игроков)
+                for ped, _ in pairs(hidden_players_peds) do
+                    if not seen[ped] then hidden_players_peds[ped] = nil end
+                end
+            end
+        elseif next(hidden_players_peds) then
+            -- восстанавливаем всех скрытых игроков при выключении функции
+            for ped, _ in pairs(hidden_players_peds) do
+                local okExist, exists = pcall(doesCharExist, ped)
+                if okExist and exists then
+                    pcall(setCharVisible, ped, true)
+                    pcall(setCharCollision, ped, true)
+                end
+            end
+            hidden_players_peds = {}
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- РАЗДЕЛ RENDERING: HIDE VEHICLES (для FPS)
+------------------------------------------------------------
+-- ПЕРЕДЕЛАНО по той же причине: sampGetVehicleIdByCarHandle — из той же
+-- сломанной семьи опкодов SAMPFUNCS id-маппинга. Теперь работаем прямо
+-- с vehicle-хэндлами из getAllVehicles() (нативно, всегда работает),
+-- через setCarVisible/setCarCollision — полностью обратимо, в отличие
+-- от старой RPC-выгрузки (raknetEmulRpcReceiveBitStream(165, ...)),
+-- которая была необратима без реконнекта.
+local render_hide_vehicles_enabled = new.bool(false)
+local hidden_vehicles_handles = {} -- [veh] = true, если сейчас скрыт
+
+local function is_vehicle_protected_handle(veh)
+    -- своя машина (та, в которой сейчас едет игрок) никогда не скрывается
+    local okExist, exists = pcall(doesCharExist, PLAYER_PED)
+    if not okExist or not exists then return false end
+    local okIn, inCar = pcall(isCharInAnyCar, PLAYER_PED)
+    if okIn and inCar then
+        local okMy, myVeh = pcall(storeCarCharIsInNoSave, PLAYER_PED)
+        if okMy and myVeh == veh then return true end
+    end
+    return false
+end
+
+lua_thread.create(function()
+    while true do
+        wait(500) -- машины на карте меняются не так часто, чтобы проверять каждый кадр
+        if render_hide_vehicles_enabled[0] then
+            local okAll, allVehicles = pcall(getAllVehicles)
+            if okAll and allVehicles then
+                local seen = {}
+                for _, veh in ipairs(allVehicles) do
+                    local okExist, exists = pcall(doesVehicleExist, veh)
+                    if okExist and exists then
+                        seen[veh] = true
+                        if not hidden_vehicles_handles[veh] and not is_vehicle_protected_handle(veh) then
+                            pcall(setCarVisible, veh, false)
+                            pcall(setCarCollision, veh, false)
+                            hidden_vehicles_handles[veh] = true
+                        end
+                    end
+                end
+                for veh, _ in pairs(hidden_vehicles_handles) do
+                    if not seen[veh] then hidden_vehicles_handles[veh] = nil end
+                end
+            end
+        elseif next(hidden_vehicles_handles) then
+            -- восстановление — теперь полностью обратимо без реконнекта
+            for veh, _ in pairs(hidden_vehicles_handles) do
+                local okExist, exists = pcall(doesVehicleExist, veh)
+                if okExist and exists then
+                    pcall(setCarVisible, veh, true)
+                    pcall(setCarCollision, veh, true)
+                end
+            end
+            hidden_vehicles_handles = {}
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- ДАННЫЕ FPS: списки ID моделей декоративных объектов по категориям
+-- (источник: сторонний скрипт FPS UP, ~5500 ID моделей, 33 категории)
+------------------------------------------------------------
+local FPS_CATEGORY_ORDER = {
+    "АЗС",
+    "Животные",
+    "Мед.оборудование",
+    "Праздничное",
+    "Стекла",
+    "Бары",
+    "Заборы и решетки",
+    "Морская атребутика",
+    "Продукты/еда/посуда",
+    "Стены",
+    "Вода",
+    "Здания",
+    "Музыкальные инструменты",
+    "Прочее",
+    "Стройка",
+    "Граффити",
+    "Одежды",
+    "Растительность",
+    "Транспорт",
+    "Двери",
+    "Казино",
+    "Оружие",
+    "Камни",
+    "Тюнинг",
+    "Дорожные знаки",
+    "Клубы",
+    "Пикапы",
+    "Свет",
+    "Ферма",
+    "Железные дороги",
+    "Магазины/рестораны",
+    "Питьевые автоматы",
+    "Эффекты",
+}
+
+local FPS_OBJECT_CATEGORIES = {
+    ["АЗС"] = {
+        1676,
+        1686,
+        3465,
+        5409,
+        5535,
+        7154,
+        7155,
+        7971,
+        10789,
+        11279,
+        11281,
+        11547,
+        11614,
+        12853,
+        13245,
+        16362,
+        16477,
+        16478,
+        17065,
+        18284,
+        18452,
+        18550
+    },
+    ["Животные"] = {
+        902,
+        1599,
+        1600,
+        1601,
+        1602,
+        1603,
+        1604,
+        1605,
+        1606,
+        1607,
+        1608,
+        1609,
+        1736,
+        1828,
+        6865,
+        11470,
+        11733,
+        16442,
+        16776,
+        19078,
+        19079,
+        19315,
+        19630,
+        19833
+    },
+    ["Мед.оборудование"] = {
+        1997,
+        2146,
+        2709,
+        3383,
+        3384,
+        3386,
+        3387,
+        3388,
+        3389,
+        3390,
+        3391,
+        3392,
+        3393,
+        3394,
+        3395,
+        3396,
+        3397,
+        10145,
+        11701,
+        11702,
+        11736,
+        11738,
+        14532,
+        14604,
+        16377
+    },
+    ["Праздничное"] = {
+        19054,
+        19055,
+        19056,
+        19057,
+        19058,
+        19059,
+        19060,
+        19061,
+        19062,
+        19063,
+        19076,
+        19320,
+        19341,
+        19342,
+        19343,
+        19344,
+        19345
+    },
+    ["Стекла"] = {
+        1649,
+        1651,
+        1846,
+        3278,
+        3850,
+        3851,
+        3857,
+        3858,
+        3859,
+        11103,
+        11217,
+        12840,
+        14643,
+        14662,
+        14677,
+        14684,
+        14799,
+        18001,
+        19325,
+        19810
+    },
+    ["Бары"] = {
+        1484,
+        1486,
+        1487,
+        1488,
+        1509,
+        1511,
+        1512,
+        1517,
+        1520,
+        1541,
+        1542,
+        1543,
+        1544,
+        1545,
+        1547,
+        1548,
+        1551,
+        1664,
+        1668,
+        1669,
+        1670,
+        1950,
+        1951,
+        2683,
+        2958,
+        11686,
+        11689,
+        14399,
+        14463,
+        14537,
+        14560,
+        14565,
+        14582,
+        14770,
+        14831,
+        16151,
+        18090,
+        19818,
+        19819,
+        19820,
+        19821,
+        19822,
+        19823,
+        19824
+    },
+    ["Заборы и решетки"] = {
+        969,
+        970,
+        971,
+        972,
+        974,
+        975,
+        976,
+        980,
+        982,
+        983,
+        984,
+        985,
+        986,
+        987,
+        988,
+        989,
+        990,
+        991,
+        992,
+        993,
+        994,
+        995,
+        996,
+        997,
+        998,
+        1407,
+        1408,
+        1410,
+        1411,
+        1412,
+        1413,
+        1414,
+        1418,
+        1419,
+        1446,
+        1447,
+        1456,
+        1460,
+        1468,
+        1552,
+        1553,
+        1652,
+        1653,
+        2909,
+        2930,
+        2933,
+        2990,
+        3036,
+        3049,
+        3050,
+        3125,
+        3275,
+        3276,
+        3281,
+        3282,
+        3451,
+        3475,
+        3550,
+        3936,
+        3937,
+        3945,
+        4099,
+        4100,
+        4189,
+        4190,
+        4195,
+        4196,
+        4201,
+        4202,
+        5001,
+        5005,
+        5007,
+        5030,
+        5062,
+        5068,
+        5070,
+        5071,
+        5072,
+        5073,
+        5074,
+        5075,
+        5076,
+        5077,
+        5190,
+        5268,
+        5306,
+        5358,
+        5363,
+        5364,
+        5415,
+        5469,
+        5660,
+        5676,
+        5677,
+        5893,
+        5993,
+        6046,
+        6049,
+        6110,
+        6253,
+        6287,
+        6489,
+        6960,
+        6961,
+        6967,
+        6968,
+        6969,
+        6970,
+        7014,
+        7016,
+        7017,
+        7018,
+        7022,
+        7026,
+        7028,
+        7029,
+        7030,
+        7031,
+        7034,
+        7038,
+        7039,
+        7095,
+        7132,
+        7191,
+        7192,
+        7193,
+        7194,
+        7195,
+        7196,
+        7197,
+        7198,
+        7202,
+        7204,
+        7205,
+        7209,
+        7210,
+        7212,
+        7213,
+        7223,
+        7224,
+        7227,
+        7243,
+        7277,
+        7292,
+        7295,
+        7296,
+        7297,
+        7298,
+        7299,
+        7319,
+        7349,
+        7350,
+        7351,
+        7352,
+        7361,
+        7367,
+        7368,
+        7369,
+        7370,
+        7371,
+        7372,
+        7373,
+        7374,
+        7375,
+        7376,
+        7377,
+        7378,
+        7379,
+        7380,
+        7381,
+        7418,
+        7423,
+        7425,
+        7514,
+        7517,
+        7524,
+        7532,
+        7538,
+        7539,
+        7540,
+        7560,
+        7593,
+        7595,
+        7611,
+        7612,
+        7613,
+        7614,
+        7615,
+        7619,
+        7623,
+        7624,
+        7657,
+        7662,
+        7663,
+        7664,
+        7665,
+        7680,
+        7688,
+        7831,
+        7837,
+        7838,
+        7839,
+        7840,
+        7841,
+        7842,
+        7895,
+        7896,
+        7897,
+        7898,
+        7899,
+        7919,
+        7939,
+        7952,
+        7953,
+        7954,
+        7956,
+        7959,
+        7960,
+        8147,
+        8148,
+        8149,
+        8150,
+        8151,
+        8152,
+        8153,
+        8154,
+        8155,
+        8165,
+        8167,
+        8173,
+        8174,
+        8175,
+        8176,
+        8177,
+        8178,
+        8179,
+        8180,
+        8181,
+        8182,
+        8183,
+        8184,
+        8185,
+        8187,
+        8190,
+        8191,
+        8192,
+        8194,
+        8195,
+        8206,
+        8207,
+        8208,
+        8209,
+        8210,
+        8262,
+        8263,
+        8266,
+        8267,
+        8268,
+        8269,
+        8270,
+        8271,
+        8272,
+        8273,
+        8274,
+        8275,
+        8276,
+        8277,
+        8278,
+        8279,
+        8311,
+        8312,
+        8313,
+        8314,
+        8315,
+        8316,
+        8317,
+        8318,
+        8320,
+        8342,
+        8366,
+        8369,
+        8416,
+        8426,
+        8429,
+        8430,
+        8549,
+        8559,
+        8592,
+        8636,
+        8645,
+        8646,
+        8647,
+        8648,
+        8649,
+        8650,
+        8651,
+        8652,
+        8653,
+        8656,
+        8657,
+        8658,
+        8659,
+        8662,
+        8673,
+        8674,
+        8680,
+        8681,
+        8682,
+        8683,
+        8684,
+        8685,
+        8686,
+        8825,
+        8826,
+        8827,
+        8828,
+        8869,
+        8984,
+        8985,
+        8986,
+        8987,
+        8988,
+        8992,
+        8993,
+        8994,
+        8995,
+        8996,
+        8997,
+        8998,
+        9029,
+        9030,
+        9031,
+        9032,
+        9033,
+        9043,
+        9080,
+        9081,
+        9092,
+        9108,
+        9109,
+        9110,
+        9111,
+        9112,
+        9134,
+        9317,
+        9318,
+        9331,
+        9333,
+        9334,
+        9335,
+        9336,
+        9339,
+        9340,
+        9343,
+        9344,
+        9347,
+        9348,
+        9349,
+        9350,
+        9430,
+        9431,
+        9434,
+        9435,
+        10252,
+        10396,
+        10402,
+        10437,
+        10442,
+        10611,
+        10662,
+        10682,
+        10683,
+        10716,
+        10762,
+        10806,
+        10807,
+        10808,
+        10809,
+        10835,
+        10836,
+        10873,
+        10874,
+        10875,
+        10885,
+        10886,
+        10887,
+        11091,
+        11101,
+        11243,
+        11374,
+        11383,
+        11438,
+        11452,
+        11473,
+        11474,
+        11481,
+        11482,
+        11499,
+        11567,
+        11568,
+        12848,
+        12933,
+        13016,
+        13024,
+        13438,
+        13445,
+        13450,
+        13598,
+        13622,
+        13623,
+        13653,
+        13659,
+        13661,
+        13663,
+        13665,
+        13699,
+        13744,
+        13878,
+        14459,
+        14464,
+        14501,
+        14513,
+        14551,
+        14843,
+        14883,
+        16094,
+        16136,
+        16144,
+        16293,
+        16294,
+        16295,
+        16296,
+        16297,
+        16298,
+        16299,
+        16300,
+        16313,
+        16315,
+        16320,
+        16321,
+        16324,
+        16369,
+        16370,
+        16391,
+        16392,
+        16393,
+        16394,
+        16627,
+        16628,
+        16629,
+        16630,
+        16631,
+        16632,
+        16633,
+        16634,
+        16635,
+        16636,
+        16664,
+        16668,
+        16669,
+        16670,
+        16671,
+        17018,
+        17510,
+        17514,
+        17516,
+        17532,
+        17583,
+        17871,
+        17898,
+        17911,
+        17912,
+        17913,
+        17968,
+        18202,
+        18216,
+        18217,
+        18218,
+        18219,
+        18220,
+        18221,
+        18222,
+        18223,
+        18224,
+        18255,
+        18276,
+        18277,
+        18278,
+        18279,
+        18280,
+        18281,
+        18432,
+        18433,
+        18434,
+        18440,
+        18441,
+        18442,
+        18443,
+        18444,
+        18445,
+        18446,
+        18551,
+        18760,
+        19302,
+        19303,
+        19304,
+        19312,
+        19313,
+        19641,
+        19865,
+        19866,
+        19868,
+        19869,
+        19870,
+        19912,
+        19913
+    },
+    ["Морская атребутика"] = {
+        1255,
+        1281,
+        1461,
+        1598,
+        1610,
+        1611,
+        1637,
+        1640,
+        1641,
+        1642,
+        1643,
+        1644,
+        1645,
+        1646,
+        1647,
+        2404,
+        2405,
+        2406,
+        2410,
+        3615,
+        3778,
+        6188,
+        6189,
+        6190,
+        6191,
+        6230,
+        6247,
+        6300,
+        6450,
+        6453,
+        6454,
+        6455,
+        11495,
+        11496,
+        11619,
+        12990,
+        13483,
+        18229,
+        18256,
+        18368,
+        18558,
+        18559,
+        933,
+        1376,
+        1378,
+        1379,
+        1380,
+        1381,
+        1382,
+        1383,
+        1384,
+        1394,
+        1395,
+        1396,
+        1398,
+        1399,
+        1400,
+        1401,
+        1402,
+        1403,
+        1404,
+        1405,
+        1406,
+        2956,
+        3474,
+        3620,
+        3724,
+        3746,
+        3879,
+        3880,
+        3886,
+        5126,
+        5155,
+        5156,
+        5157,
+        5158,
+        5159,
+        5160,
+        5161,
+        5162,
+        5163,
+        5164,
+        5165,
+        5166,
+        5167,
+        5168,
+        5252,
+        5253,
+        5304,
+        5352,
+        8493,
+        8977,
+        9575,
+        9584,
+        9585,
+        9586,
+        9587,
+        9588,
+        9590,
+        9608,
+        9619,
+        9620,
+        9621,
+        9821,
+        9958,
+        10140,
+        10141,
+        10229,
+        10230,
+        10285,
+        10769,
+        10770,
+        10771,
+        10793,
+        10794,
+        10795,
+        10824,
+        10833,
+        10834,
+        10842,
+        10894,
+        10900,
+        10901,
+        11145,
+        11146,
+        11147,
+        11148,
+        11149,
+        11150,
+        11329,
+        11331,
+        11404,
+        11406,
+        16332,
+        17910,
+        17953,
+        903,
+        953,
+        1243,
+        1612,
+        9229,
+        9230,
+        9253,
+        9257,
+        9329,
+        9365,
+        9366,
+        9367,
+        9368,
+        9369
+    },
+    ["Продукты/еда/посуда"] = {
+        1455,
+        1481,
+        1546,
+        1582,
+        1667,
+        2212,
+        2213,
+        2214,
+        2215,
+        2216,
+        2217,
+        2218,
+        2219,
+        2220,
+        2221,
+        2222,
+        2223,
+        2342,
+        2353,
+        2354,
+        2355,
+        2601,
+        2647,
+        2663,
+        2670,
+        2671,
+        2672,
+        2702,
+        2703,
+        2768,
+        2769,
+        2800,
+        2803,
+        2804,
+        2805,
+        2806,
+        2812,
+        2814,
+        2820,
+        2821,
+        2822,
+        2823,
+        2829,
+        2830,
+        2831,
+        2832,
+        2837,
+        2838,
+        2839,
+        2840,
+        2848,
+        2849,
+        2850,
+        2851,
+        2856,
+        2857,
+        2858,
+        2859,
+        2860,
+        2861,
+        2862,
+        2863,
+        2864,
+        2865,
+        2866,
+        2867,
+        2870,
+        2880,
+        2881,
+        3965,
+        11715,
+        11716,
+        11718,
+        11719,
+        11722,
+        11723,
+        11739,
+        11740,
+        11741,
+        11742,
+        11744,
+        11748,
+        14705,
+        19346,
+        19525,
+        19560,
+        19561,
+        19562,
+        19563,
+        19564,
+        19565,
+        19566,
+        19567,
+        19568,
+        19569,
+        19570,
+        19571,
+        19572,
+        19573,
+        19574,
+        19575,
+        19576,
+        19577,
+        19578,
+        19579,
+        19580,
+        19581,
+        19582,
+        19583,
+        19584,
+        19585,
+        19586,
+        19636,
+        19637,
+        19638,
+        19639,
+        19811,
+        19835,
+        19847,
+        19882,
+        19883
+    },
+    ["Стены"] = {
+        2168,
+        2187,
+        2904,
+        3063,
+        3064,
+        3097,
+        3098,
+        3099,
+        3127,
+        5066,
+        11353,
+        11354,
+        13360,
+        18758,
+        19353,
+        19354,
+        19355,
+        19356,
+        19357,
+        19358,
+        19359,
+        19360,
+        19361,
+        19362,
+        19363,
+        19364,
+        19365,
+        19366,
+        19367,
+        19368,
+        19369,
+        19370,
+        19371,
+        19372,
+        19373,
+        19375,
+        19376,
+        19377,
+        19378,
+        19379,
+        19380,
+        19381,
+        19383,
+        19384,
+        19385,
+        19386,
+        19387,
+        19388,
+        19389,
+        19390,
+        19391,
+        19392,
+        19393,
+        19394,
+        19395,
+        19396,
+        19397,
+        19398,
+        19399,
+        19400,
+        19401,
+        19402,
+        19403,
+        19404,
+        19405,
+        19406,
+        19407,
+        19408,
+        19409,
+        19410,
+        19411,
+        19412,
+        19413,
+        19414,
+        19415,
+        19416,
+        19417,
+        19426,
+        19427,
+        19428,
+        19429,
+        19430,
+        19431,
+        19432,
+        19433,
+        19434,
+        19435,
+        19436,
+        19437,
+        19438,
+        19439,
+        19440,
+        19441,
+        19442,
+        19443,
+        19444,
+        19445,
+        19446,
+        19447,
+        19448,
+        19449,
+        19450,
+        19451,
+        19452,
+        19453,
+        19454,
+        19455,
+        19456,
+        19457,
+        19458,
+        19459,
+        19460,
+        19461,
+        19462,
+        19463,
+        19464,
+        19465,
+        19466
+    },
+    ["Вода"] = {
+        3951,
+        4206,
+        6964,
+        7916,
+        8487,
+        9557,
+        9831,
+        10444,
+        19603,
+        19604,
+        19840,
+        19841,
+        19842
+    },
+    ["Здания"] = {
+        1684,
+        3167,
+        3168,
+        3169,
+        3170,
+        3171,
+        3172,
+        3173,
+        3174,
+        3175,
+        3339,
+        3340,
+        3341,
+        3342,
+        3343,
+        3344,
+        3345,
+        3346,
+        3347,
+        3569,
+        3570,
+        3588,
+        3626,
+        8591,
+        9227,
+        9228,
+        9238,
+        9323,
+        9327,
+        9328,
+        9414,
+        9415,
+        9416,
+        9417,
+        9418,
+        9419,
+        11292,
+        12978,
+        12988,
+        13065,
+        13068,
+        13189,
+        13217,
+        13389,
+        16001,
+        16137,
+        16138,
+        16359,
+        16400,
+        16615,
+        16616,
+        17012,
+        18253,
+        18520,
+        18522,
+        1677,
+        1678,
+        3243,
+        3303,
+        3304,
+        3305,
+        3306,
+        3307,
+        3308,
+        3309,
+        3310,
+        3311,
+        3312,
+        3313,
+        3314,
+        3315,
+        3316,
+        3317,
+        3318,
+        3319,
+        3320,
+        3321,
+        3322,
+        3323,
+        3324,
+        3325,
+        3326,
+        3327,
+        3328,
+        3329,
+        3351,
+        3353,
+        3436,
+        3442,
+        3443,
+        3444,
+        3445,
+        3446,
+        3449,
+        3454,
+        3455,
+        3456,
+        3457,
+        3464,
+        3466,
+        3469,
+        3478,
+        3479,
+        3480,
+        3481,
+        3483,
+        3484,
+        3485,
+        3486,
+        3487,
+        3488,
+        3500,
+        3501,
+        3523,
+        3535,
+        3536,
+        3537,
+        3539,
+        3540,
+        3541,
+        3542,
+        3543,
+        3544,
+        3545,
+        3546,
+        3547,
+        3548,
+        3549,
+        3555,
+        3556,
+        3557,
+        3558,
+        3559,
+        3560,
+        3561,
+        3562,
+        3563,
+        3579,
+        3580,
+        3581,
+        3582,
+        3583,
+        3584,
+        3587,
+        3589,
+        3590,
+        3591,
+        3592,
+        3595,
+        3596,
+        3597,
+        3598,
+        3599,
+        3600,
+        3601,
+        3602,
+        3603,
+        3604,
+        3605,
+        3606,
+        3607,
+        3608,
+        3609,
+        3612,
+        3613,
+        3614,
+        3616,
+        3618,
+        3619,
+        3639,
+        3640,
+        3641,
+        3642,
+        3646,
+        3647,
+        3648,
+        3649,
+        3654,
+        3678,
+        3679,
+        3680,
+        3681,
+        3684,
+        3685,
+        3691,
+        3692,
+        3693,
+        3698,
+        3699,
+        3700,
+        3701,
+        3702,
+        3703,
+        3704,
+        3705,
+        3711,
+        3712,
+        3713,
+        3714,
+        3718,
+        3719,
+        3720,
+        3721,
+        3726,
+        3727,
+        3728,
+        3729,
+        3730,
+        3731,
+        3732,
+        3733,
+        3734,
+        3735,
+        3736,
+        3737,
+        3738,
+        3739,
+        3740,
+        3741,
+        3742,
+        3744,
+        3759,
+        3760,
+        3762,
+        3764,
+        3765,
+        3766,
+        3767,
+        3768,
+        3772,
+        3773,
+        3774,
+        3775,
+        3820,
+        3821,
+        3822,
+        3823,
+        3824,
+        3825,
+        3826,
+        3827,
+        3828,
+        3829,
+        3830,
+        3831,
+        3832,
+        3833,
+        3834,
+        3835,
+        3836,
+        3837,
+        3838,
+        3839,
+        3840,
+        3841,
+        3842,
+        3843,
+        3844,
+        3845,
+        3846,
+        3847,
+        3848,
+        3849,
+        4973,
+        4989,
+        5060,
+        5142,
+        5341,
+        5416,
+        5421,
+        5430,
+        5516,
+        5531,
+        5626,
+        5664,
+        5709,
+        6921,
+        6922,
+        7147,
+        7533,
+        7534,
+        7535,
+        7681,
+        7928,
+        7929,
+        7932,
+        7935,
+        7936,
+        7940,
+        7941,
+        8959,
+        8970,
+        8975,
+        9098,
+        9220,
+        9221,
+        9258,
+        9259,
+        9270,
+        9271,
+        9272,
+        9273,
+        9274,
+        9275,
+        9310,
+        9319,
+        9320,
+        9321,
+        9322,
+        9324,
+        9325,
+        9326,
+        9341,
+        9384,
+        9385,
+        9386,
+        9389,
+        9390,
+        9410,
+        9411,
+        9412,
+        9413,
+        9420,
+        9422,
+        9423,
+        9424,
+        9425,
+        9426,
+        9427,
+        9592,
+        9847,
+        9895,
+        10082,
+        10084,
+        10510,
+        11434,
+        11490,
+        11491,
+        11501,
+        11566,
+        12937,
+        12938,
+        12940,
+        13252,
+        13681,
+        13687,
+        13694,
+        13695,
+        13696,
+        13697,
+        13701,
+        13721,
+        13724,
+        13725,
+        13729,
+        13746,
+        13747,
+        13753,
+        13754,
+        13755,
+        13783,
+        13816,
+        13855,
+        13874,
+        13875,
+        13877,
+        13889,
+        14818,
+        16067,
+        16106,
+        17067,
+        17697,
+        17698,
+        17699,
+        17803,
+        17804,
+        17892,
+        17893,
+        17894,
+        17895,
+        17896,
+        17900,
+        17901,
+        17903,
+        17922,
+        17923,
+        17934,
+        17935,
+        17948,
+        18242,
+        19489,
+        19490,
+        19491,
+        19492,
+        19493,
+        19494,
+        19495,
+        19496,
+        19497,
+        19498,
+        19499,
+        19500,
+        19501,
+        19502,
+        19503,
+        19504,
+        19505,
+        19506,
+        19507,
+        19508,
+        19509,
+        19510,
+        19511,
+        19512,
+        19598,
+        19599,
+        19854,
+        19855,
+        19856
+    },
+    ["Музыкальные инструменты"] = {
+        1840,
+        1841,
+        1952,
+        1953,
+        1954,
+        1955,
+        1956,
+        1957,
+        1958,
+        1960,
+        1961,
+        1962,
+        2103,
+        2229,
+        2230,
+        2231,
+        2232,
+        2233,
+        11688,
+        14391,
+        14392,
+        14403,
+        14820,
+        19128,
+        19129,
+        19157,
+        19158,
+        19159,
+        19317,
+        19318,
+        19319,
+        19608,
+        19609,
+        19610,
+        19611,
+        19612,
+        19613,
+        19614,
+        19615,
+        19616,
+        19617
+    },
+    ["Прочее"] = {
+        2098,
+        3531,
+        3715,
+        3716,
+        3749,
+        3750,
+        7033,
+        7166,
+        7522,
+        7583,
+        7691,
+        7958,
+        8556,
+        8640,
+        8670,
+        8893,
+        8945,
+        8946,
+        9482,
+        16088,
+        16089,
+        16090,
+        16091,
+        16092,
+        18275,
+        18761,
+        918,
+        930,
+        935,
+        1008,
+        1009,
+        1010,
+        1217,
+        1218,
+        1222,
+        1225,
+        1348,
+        1370,
+        2062,
+        2902,
+        3046,
+        3057,
+        3134,
+        3632,
+        3633,
+        19812,
+        19816,
+        914,
+        915,
+        919,
+        1354,
+        1420,
+        1617,
+        1618,
+        1619,
+        1620,
+        1623,
+        1624,
+        1627,
+        1635,
+        1657,
+        1661,
+        1687,
+        1688,
+        1689,
+        1690,
+        1691,
+        1692,
+        1693,
+        1695,
+        1696,
+        1971,
+        2653,
+        2718,
+        2986,
+        2989,
+        3042,
+        3280,
+        3470,
+        3804,
+        3805,
+        3812,
+        3813,
+        11483,
+        14527,
+        14578,
+        14586,
+        14773,
+        14774,
+        14775,
+        16732,
+        16779,
+        16780,
+        18201,
+        18263,
+        1636,
+        1680,
+        1681,
+        1683,
+        2034,
+        2035,
+        2036,
+        2037,
+        2038,
+        2039,
+        2040,
+        2041,
+        2042,
+        2043,
+        2044,
+        2057,
+        2060,
+        2061,
+        2064,
+        2068,
+        2918,
+        3082,
+        3095,
+        3116,
+        3267,
+        3269,
+        3270,
+        3271,
+        3277,
+        3279,
+        3367,
+        3368,
+        3369,
+        3400,
+        3401,
+        3783,
+        3786,
+        3787,
+        3788,
+        3789,
+        3790,
+        3791,
+        3792,
+        3793,
+        3794,
+        3795,
+        3797,
+        3884,
+        3885,
+        9819,
+        10029,
+        10079,
+        10757,
+        14553,
+        16639,
+        16640,
+        16641,
+        16642,
+        16643,
+        16644,
+        16645,
+        16646,
+        16647,
+        16648,
+        16649,
+        16650,
+        16652,
+        16653,
+        16654,
+        16655,
+        16656,
+        16657,
+        16658,
+        16659,
+        16660,
+        16661,
+        16662,
+        16663,
+        16665,
+        16680,
+        16681,
+        16682,
+        16782,
+        18846,
+        18848,
+        18849,
+        19164,
+        19165,
+        19166,
+        19167,
+        19168,
+        19169,
+        19170,
+        19171,
+        19777,
+        19778,
+        19779,
+        19780,
+        19781,
+        19782,
+        19783,
+        19784,
+        19785,
+        1508,
+        1966,
+        1980,
+        2885,
+        2938,
+        2957,
+        3033,
+        3034,
+        3037,
+        3055,
+        3268,
+        3294,
+        3352,
+        3354,
+        3814,
+        3815,
+        3816,
+        3817,
+        3932,
+        3939,
+        4084,
+        5020,
+        5043,
+        5056,
+        5061,
+        5170,
+        5302,
+        5340,
+        5422,
+        5582,
+        5779,
+        5856,
+        6400,
+        6517,
+        7707,
+        7709,
+        7891,
+        7927,
+        7930,
+        7931,
+        8159,
+        8235,
+        8240,
+        8241,
+        8247,
+        8248,
+        8249,
+        8250,
+        8251,
+        8252,
+        8253,
+        8324,
+        8378,
+        8379,
+        8635,
+        8947,
+        8948,
+        8954,
+        8955,
+        8956,
+        8957,
+        8958,
+        9093,
+        9099,
+        9164,
+        9165,
+        9166,
+        9167,
+        9168,
+        9624,
+        9625,
+        9823,
+        10148,
+        10149,
+        10150,
+        10154,
+        10182,
+        10184,
+        10246,
+        10258,
+        10282,
+        10558,
+        10575,
+        10671,
+        10828,
+        10830,
+        10841,
+        10888,
+        10893,
+        10914,
+        11102,
+        11313,
+        11319,
+        11320,
+        11326,
+        11327,
+        11328,
+        11359,
+        11360,
+        11376,
+        11388,
+        11389,
+        11390,
+        11391,
+        11393,
+        11416,
+        11480,
+        11492,
+        11494,
+        11502,
+        13028,
+        13187,
+        13188,
+        13817,
+        14783,
+        14796,
+        14797,
+        14798,
+        14826,
+        14878,
+        14879,
+        16098,
+        16500,
+        16501,
+        16637,
+        16771,
+        16772,
+        16773,
+        16775,
+        17073,
+        17566,
+        17950,
+        17951,
+        17952,
+        18474,
+        18525,
+        18527,
+        18553,
+        18633,
+        18634,
+        18635,
+        18644,
+        19621,
+        19627,
+        19804,
+        19815,
+        19817,
+        19861,
+        19862,
+        19863,
+        19864,
+        19872,
+        19880,
+        19899,
+        19900,
+        19903,
+        19906,
+        19908,
+        19910,
+        19911,
+        921,
+        925,
+        927,
+        931,
+        936,
+        937,
+        938,
+        940,
+        941,
+        945,
+        2567,
+        2633,
+        2649,
+        3193,
+        3214,
+        3255,
+        3256,
+        3257,
+        3258,
+        3259,
+        3274,
+        3286,
+        3287,
+        3288,
+        3289,
+        3290,
+        3291,
+        3295,
+        3296,
+        3338,
+        3375,
+        3376,
+        3424,
+        3425,
+        3426,
+        3427,
+        3428,
+        3489,
+        3490,
+        3491,
+        3492,
+        3518,
+        3519,
+        3617,
+        3622,
+        3623,
+        3624,
+        3628,
+        3629,
+        3634,
+        3635,
+        3636,
+        3637,
+        3638,
+        3643,
+        3661,
+        3662,
+        3664,
+        3666,
+        3667,
+        3668,
+        3669,
+        3670,
+        3671,
+        3672,
+        3673,
+        3674,
+        3675,
+        3676,
+        3677,
+        3682,
+        3683,
+        3687,
+        3689,
+        3690,
+        3695,
+        3696,
+        3697,
+        3706,
+        3707,
+        3708,
+        3709,
+        3710,
+        3745,
+        3753,
+        3755,
+        3756,
+        3758,
+        3761,
+        3763,
+        3776,
+        3777,
+        3779,
+        3785,
+        3852,
+        4880,
+        4886,
+        4887,
+        4888,
+        4892,
+        4893,
+        4899,
+        4901,
+        4928,
+        4990,
+        5006,
+        5010,
+        5011,
+        5016,
+        5017,
+        5019,
+        5040,
+        5041,
+        5127,
+        5129,
+        5131,
+        5132,
+        5135,
+        5136,
+        5138,
+        5196,
+        5202,
+        5206,
+        5214,
+        5215,
+        5309,
+        5310,
+        5313,
+        5317,
+        5461,
+        5462,
+        5527,
+        5532,
+        5551,
+        5597,
+        5598,
+        5705,
+        5706,
+        5837,
+        5892,
+        5894,
+        5895,
+        5927,
+        5934,
+        5938,
+        5943,
+        5946,
+        5948,
+        5950,
+        5951,
+        5955,
+        5959,
+        5960,
+        5963,
+        6490,
+        6491,
+        6928,
+        6929,
+        6930,
+        6931,
+        6932,
+        6933,
+        6934,
+        6935,
+        6936,
+        6937,
+        6938,
+        6939,
+        6940,
+        6941,
+        6942,
+        6943,
+        7020,
+        7103,
+        7105,
+        7144,
+        7145,
+        7146,
+        7148,
+        7229,
+        7236,
+        7237,
+        7238,
+        7239,
+        7291,
+        7344,
+        7345,
+        7346,
+        7347,
+        7672,
+        7683,
+        7685,
+        7687,
+        7693,
+        7704,
+        7708,
+        7832,
+        7860,
+        7861,
+        7947,
+        7948,
+        7949,
+        7950,
+        7981,
+        8057,
+        8058,
+        8059,
+        8060,
+        8061,
+        8062,
+        8063,
+        8064,
+        8065,
+        8066,
+        8067,
+        8068,
+        8069,
+        8113,
+        8116,
+        8117,
+        8118,
+        8120,
+        8156,
+        8157,
+        8158,
+        8160,
+        8242,
+        8243,
+        8254,
+        8255,
+        8544,
+        8545,
+        8546,
+        8737,
+        8738,
+        8739,
+        8795,
+        8867,
+        8937,
+        8938,
+        9162,
+        9163,
+        9680,
+        9681,
+        10576,
+        10675,
+        10775,
+        10776,
+        10796,
+        10797,
+        10810,
+        10811,
+        10812,
+        10813,
+        10814,
+        10831,
+        10840,
+        10843,
+        10856,
+        11081,
+        11085,
+        11086,
+        11087,
+        11088,
+        11089,
+        11090,
+        11092,
+        11093,
+        11236,
+        11270,
+        11271,
+        11282,
+        11290,
+        11291,
+        11293,
+        11294,
+        11295,
+        11296,
+        11314,
+        11387,
+        11405,
+        11727,
+        12805,
+        12911,
+        12912,
+        12913,
+        12918,
+        12923,
+        12924,
+        12925,
+        12928,
+        12929,
+        12931,
+        12932,
+        12934,
+        12956,
+        12981,
+        13025,
+        13027,
+        13048,
+        13053,
+        13054,
+        13077,
+        13079,
+        13141,
+        13190,
+        13191,
+        13194,
+        13196,
+        13197,
+        13198,
+        13200,
+        13201,
+        13202,
+        13203,
+        13204,
+        13218,
+        13219,
+        13220,
+        13221,
+        13222,
+        13223,
+        13224,
+        13226,
+        13227,
+        13249,
+        13364,
+        13365,
+        13477,
+        13488,
+        13489,
+        14574,
+        14575,
+        14584,
+        14585,
+        14635,
+        14680,
+        14687,
+        14776,
+        14784,
+        16071,
+        16072,
+        16073,
+        16074,
+        16075,
+        16076,
+        16078,
+        16079,
+        16082,
+        16083,
+        16272,
+        16309,
+        16311,
+        16314,
+        16318,
+        16322,
+        16338,
+        16339,
+        16340,
+        16341,
+        16342,
+        16343,
+        16344,
+        16345,
+        16346,
+        16347,
+        16348,
+        16349,
+        16350,
+        16351,
+        16352,
+        16353,
+        16354,
+        16355,
+        16356,
+        16399,
+        16409,
+        16413,
+        16597,
+        16602,
+        16603,
+        16604,
+        16605,
+        16606,
+        16617,
+        16618,
+        16619,
+        16621,
+        16626,
+        16666,
+        17000,
+        17001,
+        17007,
+        17013,
+        17014,
+        17015,
+        17016,
+        17017,
+        17021,
+        17022,
+        17023,
+        17024,
+        17049,
+        17050,
+        17051,
+        17052,
+        17053,
+        17055,
+        17060,
+        17064,
+        17339,
+        17340,
+        17341,
+        17342,
+        17343,
+        17344,
+        17345,
+        17346,
+        17347,
+        17348,
+        17503,
+        17515,
+        17517,
+        17519,
+        17520,
+        17521,
+        17526,
+        17529,
+        17538,
+        17544,
+        17756,
+        17761,
+        17766,
+        17767,
+        17770,
+        17771,
+        17841,
+        17855,
+        17862,
+        17868,
+        17932,
+        18200,
+        18245,
+        18246,
+        18247,
+        18248,
+        18249,
+        18250,
+        18251,
+        18252,
+        18254,
+        18499,
+        18529,
+        18531,
+        18532,
+        18534,
+        18535,
+        18536,
+        18548,
+        18549,
+        18552,
+        18554,
+        18555,
+        18556,
+        18557,
+        19907,
+        849,
+        850,
+        851,
+        852,
+        853,
+        854,
+        1227,
+        1235,
+        1264,
+        1265,
+        1362,
+        1415,
+        1442,
+        1462,
+        1574,
+        2059,
+        2673,
+        2674,
+        2675,
+        2676,
+        2677,
+        2890,
+        5291,
+        5357,
+        10248,
+        10984,
+        12954,
+        12955,
+        14583,
+        18533,
+        18560,
+        18862,
+        19468,
+        19772,
+        1593,
+        2892,
+        2899,
+        3007,
+        3008,
+        3009,
+        3010,
+        3011,
+        3012,
+        3085,
+        3087,
+        3088,
+        3092,
+        11749,
+        11750,
+        18642,
+        18646,
+        19418,
+        19419,
+        19420,
+        19620,
+        19797,
+        19834,
+        19942,
+        920,
+        929,
+        934,
+        943,
+        952,
+        1211,
+        1214,
+        1215,
+        1216,
+        1237,
+        1256,
+        1257,
+        1280,
+        1285,
+        1286,
+        1287,
+        1288,
+        1289,
+        1293,
+        1340,
+        1341,
+        1342,
+        1363,
+        1366,
+        1368,
+        1478,
+        1549,
+        1570,
+        1571,
+        1804,
+        3039,
+        3040,
+        3041,
+        3244,
+        3407,
+        3408,
+        3435,
+        3437,
+        3515,
+        3657,
+        3801,
+        3809,
+        3860,
+        3861,
+        3862,
+        3863,
+        3959,
+        4724,
+        5876,
+        6050,
+        6052,
+        6066,
+        6068,
+        6457,
+        6458,
+        6462,
+        6465,
+        6466,
+        6965,
+        7182,
+        7183,
+        7220,
+        7226,
+        7230,
+        7231,
+        7264,
+        7265,
+        7266,
+        7267,
+        7268,
+        7274,
+        7275,
+        7278,
+        7285,
+        7289,
+        7290,
+        7314,
+        7315,
+        7316,
+        7330,
+        7331,
+        7332,
+        7342,
+        7655,
+        7666,
+        8394,
+        8406,
+        8491,
+        8492,
+        8573,
+        8574,
+        8576,
+        8579,
+        8580,
+        8589,
+        8621,
+        9833,
+        10281,
+        10283,
+        10932,
+        11395,
+        11420,
+        11489,
+        13667,
+        14401,
+        16063,
+        16448,
+        16778,
+        910,
+        916,
+        917,
+        922,
+        923,
+        924,
+        926,
+        928,
+        939,
+        942,
+        944,
+        960,
+        961,
+        964,
+        1220,
+        1221,
+        1224,
+        1230,
+        1236,
+        1258,
+        1271,
+        1291,
+        1292,
+        1299,
+        1300,
+        1328,
+        1329,
+        1330,
+        1346,
+        1347,
+        1353,
+        1355,
+        1356,
+        1357,
+        1358,
+        1359,
+        1365,
+        1367,
+        1371,
+        1372,
+        1409,
+        1421,
+        1430,
+        1431,
+        1438,
+        1439,
+        1440,
+        1441,
+        1503,
+        1558,
+        1685,
+        2358,
+        2359,
+        2669,
+        2678,
+        2900,
+        2912,
+        2925,
+        2926,
+        2932,
+        2934,
+        2935,
+        2943,
+        2968,
+        2969,
+        2971,
+        2972,
+        2973,
+        2974,
+        2975,
+        2977,
+        2984,
+        2991,
+        3005,
+        3006,
+        3013,
+        3014,
+        3015,
+        3016,
+        3035,
+        3043,
+        3052,
+        3066,
+        3073,
+        3370,
+        3377,
+        3378,
+        3564,
+        3565,
+        3566,
+        3567,
+        3568,
+        3571,
+        3572,
+        3573,
+        3574,
+        3575,
+        3576,
+        3577,
+        3585,
+        3621,
+        3625,
+        3630,
+        3631,
+        3688,
+        3722,
+        3723,
+        3769,
+        3770,
+        3796,
+        3798,
+        3799,
+        3800,
+        3958,
+        5244,
+        5261,
+        5262,
+        5269,
+        5855,
+        7025,
+        7102,
+        7104,
+        7169,
+        7170,
+        7171,
+        7172,
+        7185,
+        7186,
+        7317,
+        7318,
+        7515,
+        7516,
+        7527,
+        7561,
+        7620,
+        7621,
+        7622,
+        7667,
+        7674,
+        7675,
+        7676,
+        7677,
+        7678,
+        7679,
+        7833,
+        7834,
+        7835,
+        7836,
+        8073,
+        8074,
+        8075,
+        8076,
+        8077,
+        8078,
+        8114,
+        8115,
+        8119,
+        8121,
+        8123,
+        8163,
+        8334,
+        8335,
+        8336,
+        8337,
+        8338,
+        8339,
+        8340,
+        8341,
+        8883,
+        8884,
+        8885,
+        8886,
+        8960,
+        8961,
+        8962,
+        8963,
+        9589,
+        9604,
+        10231,
+        10773,
+        10774,
+        10915,
+        11009,
+        11706,
+        12859,
+        12860,
+        12861,
+        12977,
+        13192,
+        13193,
+        13195,
+        14549,
+        14552,
+        14558,
+        14600,
+        14612,
+        14613,
+        14800,
+        16310,
+        17019,
+        17020,
+        18203,
+        18257,
+        18260,
+        19321,
+        19589        
+    },
+    ["Стройка"] = {
+        1301,
+        1385,
+        1386,
+        1387,
+        1388,
+        1389,
+        1390,
+        1391,
+        1392,
+        1393,
+        1397,
+        1426,
+        1436,
+        1448,
+        1449,
+        1450,
+        1457,
+        1463,
+        1464,
+        1465,
+        1466,
+        1467,
+        1469,
+        1470,
+        1471,
+        1472,
+        1473,
+        1474,
+        1475,
+        1476,
+        1477,
+        1519,
+        1521,
+        2917,
+        2960,
+        3053,
+        3054,
+        3056,
+        3502,
+        3504,
+        3529,
+        3530,
+        3864,
+        3865,
+        3866,
+        3867,
+        3868,
+        3869,
+        3887,
+        3888,
+        7015,
+        7089,
+        7141,
+        7175,
+        7180,
+        8870,
+        8873,
+        8875,
+        8877,
+        8879,
+        8951,
+        9020,
+        9484,
+        9618,
+        9766,
+        9767,
+        9817,
+        9870,
+        10987,
+        11400,
+        11401,
+        11703,
+        11708,
+        12927,
+        12930,
+        13029,
+        16328,
+        16329,
+        16330,
+        18886
+    },
+    ["Граффити"] = {
+        1490,
+        1524,
+        1525,
+        1526,
+        1527,
+        1528,
+        1529,
+        1530,
+        1531,
+        4227,
+        5069,
+        5078,
+        5083,
+        5084,
+        5086,
+        5366,
+        5368,
+        5369,
+        5370,
+        5371,
+        5372,
+        5374,
+        5375,
+        5872,
+        14840,
+        17969,
+        18659,
+        18660,
+        18661,
+        18662,
+        18663,
+        18664,
+        18665,
+        18666,
+        18667
+    },
+    ["Одежды"] = {
+        2052,
+        2053,
+        2054,
+        2819,
+        2843,
+        2844,
+        2845,
+        2846,
+        11704,
+        11735,
+        18636,
+        18637,
+        18638,
+        18639,
+        18640,
+        18645,
+        18891,
+        18892,
+        18893,
+        18894,
+        18895,
+        18896,
+        18897,
+        18898,
+        18899,
+        18900,
+        18901,
+        18902,
+        18903,
+        18904,
+        18905,
+        18906,
+        18907,
+        18908,
+        18909,
+        18910,
+        18911,
+        18912,
+        18913,
+        18914,
+        18915,
+        18916,
+        18917,
+        18918,
+        18919,
+        18920,
+        18921,
+        18922,
+        18923,
+        18924,
+        18925,
+        18926,
+        18927,
+        18928,
+        18929,
+        18930,
+        18931,
+        18932,
+        18933,
+        18934,
+        18935,
+        18936,
+        18937,
+        18938,
+        18939,
+        18940,
+        18941,
+        18942,
+        18943,
+        18944,
+        18945,
+        18946,
+        18947,
+        18948,
+        18949,
+        18950,
+        18951,
+        18952,
+        18953,
+        18954,
+        18955,
+        18956,
+        18957,
+        18958,
+        18959,
+        18960,
+        18961,
+        18962,
+        18963,
+        18964,
+        18965,
+        18966,
+        18967,
+        18968,
+        18969,
+        18970,
+        18971,
+        18972,
+        18973,
+        18974,
+        18975,
+        18976,
+        18977,
+        18978,
+        18979,
+        19006,
+        19007,
+        19008,
+        19009,
+        19010,
+        19011,
+        19012,
+        19013,
+        19014,
+        19015,
+        19016,
+        19017,
+        19018,
+        19019,
+        19020,
+        19021,
+        19022,
+        19023,
+        19024,
+        19025,
+        19026,
+        19027,
+        19028,
+        19029,
+        19030,
+        19031,
+        19032,
+        19033,
+        19034,
+        19035,
+        19036,
+        19037,
+        19038,
+        19039,
+        19040,
+        19041,
+        19042,
+        19043,
+        19044,
+        19045,
+        19046,
+        19047,
+        19048,
+        19049,
+        19050,
+        19051,
+        19052,
+        19053,
+        19064,
+        19065,
+        19066,
+        19067,
+        19068,
+        19069,
+        19077,
+        19085,
+        19093,
+        19094,
+        19095,
+        19096,
+        19097,
+        19098,
+        19099,
+        19100,
+        19101,
+        19102,
+        19103,
+        19104,
+        19105,
+        19106,
+        19107,
+        19108,
+        19109,
+        19110,
+        19111,
+        19112,
+        19113,
+        19114,
+        19115,
+        19116,
+        19117,
+        19118,
+        19119,
+        19120,
+        19136,
+        19137,
+        19138,
+        19139,
+        19140,
+        19141,
+        19142,
+        19160,
+        19161,
+        19162,
+        19163,
+        19200,
+        19274,
+        19330,
+        19331,
+        19348,
+        19349,
+        19352,
+        19421,
+        19422,
+        19423,
+        19424,
+        19469,
+        19472,
+        19487,
+        19488,
+        19514,
+        19515,
+        19516,
+        19517,
+        19518,
+        19519,
+        19520,
+        19521,
+        19528,
+        19553,
+        19554,
+        19555,
+        19556,
+        19557,
+        19558,
+        19559,
+        19773,
+        19801,
+        19904
+    },
+    ["Растительность"] = {
+        615,
+        616,
+        617,
+        618,
+        619,
+        620,
+        621,
+        622,
+        623,
+        624,
+        629,
+        634,
+        641,
+        645,
+        648,
+        649,
+        652,
+        654,
+        655,
+        656,
+        657,
+        658,
+        659,
+        660,
+        661,
+        664,
+        669,
+        670,
+        671,
+        672,
+        673,
+        674,
+        676,
+        680,
+        681,
+        683,
+        684,
+        685,
+        686,
+        687,
+        688,
+        689,
+        690,
+        691,
+        693,
+        694,
+        695,
+        696,
+        697,
+        698,
+        700,
+        703,
+        704,
+        705,
+        706,
+        707,
+        708,
+        709,
+        710,
+        711,
+        712,
+        714,
+        715,
+        716,
+        717,
+        718,
+        719,
+        720,
+        721,
+        722,
+        723,
+        724,
+        725,
+        726,
+        727,
+        729,
+        730,
+        731,
+        732,
+        733,
+        734,
+        735,
+        736,
+        737,
+        738,
+        739,
+        740,
+        763,
+        764,
+        765,
+        766,
+        767,
+        768,
+        769,
+        770,
+        771,
+        772,
+        773,
+        774,
+        775,
+        776,
+        777,
+        778,
+        779,
+        780,
+        781,
+        782,
+        783,
+        784,
+        785,
+        786,
+        787,
+        788,
+        790,
+        791,
+        792,
+        831,
+        832,
+        833,
+        834,
+        835,
+        836,
+        837,
+        838,
+        839,
+        840,
+        843,
+        844,
+        845,
+        846,
+        847,
+        848,
+        858,
+        881,
+        882,
+        883,
+        884,
+        885,
+        886,
+        887,
+        888,
+        889,
+        890,
+        891,
+        892,
+        893,
+        894,
+        895,
+        16060,
+        16061,
+        18268,
+        18269,
+        18270,
+        18271,
+        18272,
+        18273,
+        904,
+        3505,
+        3506,
+        3507,
+        3508,
+        3509,
+        3510,
+        3511,
+        3512,
+        3517,
+        3898,
+        3948,
+        625,
+        626,
+        627,
+        628,
+        630,
+        631,
+        632,
+        633,
+        637,
+        638,
+        640,
+        644,
+        646,
+        741,
+        742,
+        743,
+        948,
+        949,
+        950,
+        1360,
+        1361,
+        1364,
+        1597,
+        2001,
+        2010,
+        2011,
+        2194,
+        2195,
+        2203,
+        2240,
+        2241,
+        2242,
+        2243,
+        2244,
+        2245,
+        2252,
+        2253,
+        2811,
+        3439,
+        3660,
+        3802,
+        3806,
+        3810,
+        3811,
+        8851,
+        8853,
+        8854,
+        8855,
+        8856,
+        8865,
+        8866,
+        11246,
+        11247,
+        14728,
+        14804,
+        14834,
+        15038,
+        18012,
+        18014,
+        635,
+        636,
+        639,
+        647,
+        650,
+        651,
+        653,
+        675,
+        677,
+        678,
+        679,
+        682,
+        692,
+        701,
+        702,
+        713,
+        728,
+        753,
+        754,
+        755,
+        756,
+        757,
+        759,
+        760,
+        761,
+        762,
+        789,
+        800,
+        801,
+        802,
+        803,
+        804,
+        805,
+        806,
+        808,
+        809,
+        810,
+        811,
+        812,
+        813,
+        814,
+        815,
+        817,
+        818,
+        819,
+        820,
+        821,
+        822,
+        823,
+        824,
+        825,
+        826,
+        827,
+        841,
+        842,
+        855,
+        856,
+        857,
+        859,
+        860,
+        861,
+        862,
+        863,
+        864,
+        865,
+        866,
+        871,
+        872,
+        873,
+        874,
+        875,
+        876,
+        2345,
+        3522,
+        3920,
+        4034,
+        4184,
+        4185,
+        5023,
+        5024,
+        5025,
+        5339,
+        5847,
+        5877,
+        5888,
+        6237,
+        6344,
+        6399,
+        6403,
+        6421,
+        6430,
+        6431,
+        6444,
+        7884,
+        7986,
+        8319,
+        8321,
+        8617,
+        8619,
+        8679,
+        8835,
+        8836,
+        8837,
+        8846,
+        8852,
+        8989,
+        9019,
+        9034,
+        9035,
+        9153,
+        9812,
+        13174,
+        13802,
+        14400,
+        14402,
+        14468,
+        14469,
+        16390,
+        16403,
+        17592,
+        17872,
+        17941,
+        17942,
+        17947,
+        17958,
+        18011,
+        18013,
+        18015,
+        19473,
+        19837,
+        19838,
+        19839,
+        869,
+        870,
+        877,
+        878,
+        3520,
+        3532,
+        3946,
+        4172,
+        4173,
+        4174,
+        4175,
+        4992,
+        4993,
+        8623,
+        8660,
+        8887,
+        8888,
+        8990,
+        8991,
+        9152,
+        11413,
+        11414
+    },
+    ["Транспорт"] = {
+        400,
+        401,
+        402,
+        403,
+        404,
+        405,
+        406,
+        407,
+        408,
+        409,
+        410,
+        411,
+        412,
+        413,
+        414,
+        415,
+        416,
+        417,
+        418,
+        419,
+        420,
+        421,
+        422,
+        423,
+        424,
+        425,
+        426,
+        427,
+        428,
+        429,
+        430,
+        431,
+        432,
+        433,
+        434,
+        435,
+        436,
+        437,
+        438,
+        439,
+        440,
+        441,
+        442,
+        443,
+        444,
+        445,
+        446,
+        447,
+        448,
+        449,
+        450,
+        451,
+        452,
+        453,
+        454,
+        455,
+        456,
+        457,
+        458,
+        459,
+        460,
+        461,
+        462,
+        463,
+        464,
+        465,
+        466,
+        467,
+        468,
+        469,
+        470,
+        471,
+        472,
+        473,
+        474,
+        475,
+        476,
+        477,
+        478,
+        479,
+        480,
+        481,
+        482,
+        483,
+        484,
+        485,
+        486,
+        487,
+        488,
+        489,
+        490,
+        491,
+        492,
+        493,
+        494,
+        495,
+        496,
+        497,
+        498,
+        499,
+        500,
+        501,
+        502,
+        503,
+        504,
+        505,
+        506,
+        507,
+        508,
+        509,
+        510,
+        511,
+        512,
+        513,
+        514,
+        515,
+        516,
+        517,
+        518,
+        519,
+        520,
+        521,
+        522,
+        523,
+        524,
+        525,
+        526,
+        527,
+        528,
+        529,
+        530,
+        531,
+        532,
+        533,
+        534,
+        535,
+        536,
+        537,
+        538,
+        539,
+        540,
+        541,
+        542,
+        543,
+        544,
+        545,
+        546,
+        547,
+        548,
+        549,
+        550,
+        551,
+        552,
+        553,
+        554,
+        555,
+        556,
+        557,
+        558,
+        559,
+        560,
+        561,
+        562,
+        563,
+        564,
+        565,
+        566,
+        567,
+        568,
+        569,
+        570,
+        571,
+        572,
+        573,
+        574,
+        575,
+        576,
+        577,
+        578,
+        579,
+        580,
+        581,
+        582,
+        583,
+        584,
+        585,
+        586,
+        587,
+        588,
+        589,
+        590,
+        591,
+        592,
+        593,
+        594,
+        595,
+        596,
+        597,
+        598,
+        599,
+        600,
+        601,
+        602,
+        603,
+        604,
+        605,
+        606,
+        607,
+        608,
+        609,
+        610,
+        611,
+        3593,
+        3594,
+        12957,
+        13591,
+        18451
+    },
+    ["Двери"] = {
+        977,
+        1491,
+        1492,
+        1493,
+        1494,
+        1495,
+        1496,
+        1497,
+        1498,
+        1499,
+        1500,
+        1501,
+        1502,
+        1504,
+        1505,
+        1506,
+        1507,
+        1522,
+        1523,
+        1532,
+        1533,
+        1535,
+        1536,
+        1537,
+        1538,
+        1555,
+        1556,
+        1557,
+        1560,
+        1561,
+        1566,
+        1567,
+        1569,
+        1965,
+        1967,
+        2634,
+        2679,
+        2873,
+        2875,
+        2876,
+        2877,
+        2878,
+        2879,
+        2911,
+        2924,
+        2927,
+        2928,
+        2929,
+        2944,
+        2946,
+        2947,
+        2948,
+        2949,
+        2951,
+        2952,
+        2954,
+        2955,
+        2959,
+        2963,
+        2970,
+        2987,
+        2988,
+        3029,
+        3061,
+        3062,
+        3089,
+        3093,
+        3109,
+        11714,
+        14638,
+        14819,
+        17564,
+        19176,
+        19795,
+        19796,
+        19799,
+        19802,
+        19857,
+        19858,
+        19859,
+        19860,
+        19875
+    },
+    ["Казино"] = {
+        1515,
+        1824,
+        1830,
+        1831,
+        1832,
+        1833,
+        1834,
+        1835,
+        1836,
+        1837,
+        1838,
+        1895,
+        1896,
+        2325,
+        2640,
+        2681,
+        2778,
+        2779,
+        2783,
+        2785,
+        2786,
+        2872,
+        298,
+        1658,
+        1659,
+        1851,
+        1852,
+        1853,
+        1854,
+        1855,
+        1856,
+        1857,
+        1858,
+        1859,
+        1860,
+        1861,
+        1862,
+        1863,
+        1864,
+        1865,
+        1866,
+        1867,
+        1868,
+        1869,
+        1870,
+        1877,
+        1878,
+        1879,
+        1880,
+        1881,
+        1882,
+        1897,
+        1901,
+        1902,
+        1903,
+        1904,
+        1911,
+        1921,
+        1929,
+        1930,
+        1931,
+        1932,
+        1933,
+        1940,
+        1941,
+        1947,
+        1978,
+        1979,
+        2188,
+        2189,
+        2324,
+        2326,
+        2327,
+        2347,
+        2348,
+        2349,
+        2591,
+        2592,
+        2784,
+        2979,
+        2981,
+        2982,
+        2992,
+        3528,
+        7288,
+        14561,
+        14562,
+        14563,
+        14564,
+        14566,
+        14567,
+        14568,
+        14605,
+        14608,
+        14628,
+        14637,
+        19474
+    },
+    ["Оружие"] = {
+        321,
+        322,
+        323,
+        324,
+        325,
+        326,
+        327,
+        328,
+        330,
+        331,
+        333,
+        334,
+        335,
+        336,
+        337,
+        338,
+        339,
+        341,
+        342,
+        343,
+        344,
+        345,
+        346,
+        347,
+        348,
+        349,
+        350,
+        351,
+        352,
+        353,
+        354,
+        355,
+        356,
+        357,
+        358,
+        359,
+        360,
+        361,
+        362,
+        363,
+        364,
+        365,
+        366,
+        367,
+        368,
+        369,
+        370,
+        371,
+        372,
+        373,
+        1672,
+        2033,
+        2045,
+        2228,
+        2237,
+        2690,
+        2985,
+        3028,
+        3070,
+        3124,
+        8644,
+        14666,
+        19086,
+        19590,
+        19623,
+        19626,
+        19631
+    },
+    ["Камни"] = {
+        744,
+        745,
+        746,
+        747,
+        748,
+        749,
+        750,
+        751,
+        752,
+        758,
+        807,
+        816,
+        828,
+        829,
+        830,
+        867,
+        868,
+        879,
+        880,
+        896,
+        897,
+        898,
+        899,
+        900,
+        901,
+        905,
+        906,
+        1207,
+        1303,
+        1304,
+        1305,
+        2936,
+        3929,
+        3930,
+        3931,
+        7588,
+        8483,
+        8782,
+        9044,
+        9045,
+        9048,
+        9049,
+        10166,
+        10286,
+        11498,
+        11556,
+        11639,
+        11640,
+        11641,
+        13023,
+        13368,
+        16104,
+        16110,
+        16111,
+        16112,
+        16113,
+        16114,
+        16115,
+        16116,
+        16117,
+        16118,
+        16119,
+        16120,
+        16121,
+        16122,
+        16123,
+        16124,
+        16125,
+        16126,
+        16127,
+        16128,
+        16129,
+        16130,
+        16131,
+        16133,
+        16134,
+        16139,
+        16140,
+        16141,
+        16142,
+        16145,
+        16302,
+        16304,
+        16305,
+        16411,
+        16503,
+        16573,
+        16667,
+        16675,
+        16692,
+        16698,
+        16699,
+        16700,
+        16701,
+        16702,
+        16703,
+        16704,
+        16705,
+        16706,
+        16707,
+        16708,
+        16709,
+        16710,
+        16711,
+        16712,
+        16713,
+        16714,
+        16715,
+        16716,
+        16717,
+        16718,
+        16719,
+        16720,
+        16721,
+        16722,
+        16723,
+        16724,
+        16725,
+        16726,
+        16727,
+        16728,
+        17025,
+        17026,
+        17027,
+        17028,
+        17029,
+        17030,
+        17031,
+        17032,
+        17033,
+        17034,
+        17035,
+        17069,
+        17071,
+        17076,
+        17299,
+        17449,
+        17472,
+        18225,
+        18226,
+        18227,
+        18228
+    },
+    ["Тюнинг"] = {
+        1000,
+        1001,
+        1002,
+        1003,
+        1004,
+        1005,
+        1006,
+        1007,
+        1011,
+        1012,
+        1013,
+        1014,
+        1015,
+        1016,
+        1017,
+        1018,
+        1019,
+        1020,
+        1021,
+        1022,
+        1023,
+        1024,
+        1025,
+        1026,
+        1027,
+        1028,
+        1029,
+        1030,
+        1031,
+        1032,
+        1033,
+        1034,
+        1035,
+        1036,
+        1037,
+        1038,
+        1039,
+        1040,
+        1041,
+        1042,
+        1043,
+        1044,
+        1045,
+        1046,
+        1047,
+        1048,
+        1049,
+        1050,
+        1051,
+        1052,
+        1053,
+        1054,
+        1055,
+        1056,
+        1057,
+        1058,
+        1059,
+        1060,
+        1061,
+        1062,
+        1063,
+        1064,
+        1065,
+        1066,
+        1067,
+        1068,
+        1069,
+        1070,
+        1071,
+        1072,
+        1073,
+        1074,
+        1075,
+        1076,
+        1077,
+        1078,
+        1079,
+        1080,
+        1081,
+        1082,
+        1083,
+        1084,
+        1085,
+        1088,
+        1089,
+        1090,
+        1091,
+        1092,
+        1093,
+        1094,
+        1095,
+        1096,
+        1097,
+        1098,
+        1099,
+        1100,
+        1101,
+        1102,
+        1103,
+        1104,
+        1105,
+        1106,
+        1107,
+        1108,
+        1110,
+        1111,
+        1112,
+        1113,
+        1114,
+        1115,
+        1116,
+        1117,
+        1118,
+        1119,
+        1120,
+        1121,
+        1122,
+        1123,
+        1124,
+        1125,
+        1126,
+        1127,
+        1128,
+        1129,
+        1130,
+        1131,
+        1132,
+        1133,
+        1134,
+        1135,
+        1136,
+        1137,
+        1138,
+        1139,
+        1140,
+        1141,
+        1142,
+        1143,
+        1144,
+        1145,
+        1146,
+        1147,
+        1148,
+        1149,
+        1150,
+        1151,
+        1152,
+        1153,
+        1154,
+        1155,
+        1156,
+        1157,
+        1158,
+        1159,
+        1160,
+        1161,
+        1162,
+        1163,
+        1164,
+        1165,
+        1166,
+        1167,
+        1168,
+        1169,
+        1170,
+        1171,
+        1172,
+        1173,
+        1174,
+        1175,
+        1176,
+        1177,
+        1178,
+        1179,
+        1180,
+        1181,
+        1182,
+        1183,
+        1184,
+        1185,
+        1186,
+        1187,
+        1188,
+        1189,
+        1190,
+        1191,
+        1192,
+        1193,
+        1327
+    },
+    ["Дорожные знаки"] = {
+        1223,
+        1226,
+        1229,
+        1231,
+        1232,
+        1233,
+        1234,
+        1259,
+        1260,
+        1261,
+        1262,
+        1263,
+        1266,
+        1267,
+        1268,
+        1269,
+        1270,
+        1278,
+        1283,
+        1284,
+        1290,
+        1294,
+        1295,
+        1296,
+        1297,
+        1298,
+        1306,
+        1307,
+        1308,
+        1309,
+        1311,
+        1315,
+        1319,
+        1320,
+        1321,
+        1322,
+        1323,
+        1324,
+        1325,
+        1350,
+        1351,
+        1352,
+        1373,
+        1374,
+        1375,
+        1443,
+        1444,
+        1539,
+        1540,
+        1568,
+        1673,
+        3110,
+        3262,
+        3263,
+        3264,
+        3265,
+        3334,
+        3335,
+        3336,
+        3337,
+        3379,
+        3380,
+        3398,
+        3410,
+        3434,
+        3447,
+        3459,
+        3460,
+        3461,
+        3463,
+        3467,
+        3468,
+        3472,
+        3482,
+        3513,
+        3514,
+        3516,
+        3521,
+        3552,
+        3553,
+        3554,
+        3754,
+        3757,
+        3818,
+        3853,
+        3854,
+        3855,
+        3856,
+        3875,
+        3926,
+        3927,
+        4239,
+        4729,
+        4730,
+        4731,
+        4732,
+        4733,
+        4734,
+        4735,
+        4754,
+        4756,
+        4758,
+        4759,
+        5742,
+        5811,
+        5846,
+        6004,
+        6056,
+        6358,
+        6422,
+        6524,
+        6958,
+        6963,
+        6986,
+        7093,
+        7246,
+        7301,
+        7302,
+        7303,
+        7309,
+        7310,
+        7388,
+        7390,
+        7391,
+        7392,
+        7415,
+        7597,
+        7606,
+        7617,
+        7900,
+        7901,
+        7902,
+        7903,
+        7904,
+        7905,
+        7906,
+        7907,
+        7908,
+        7909,
+        7910,
+        7911,
+        7912,
+        7913,
+        7914,
+        7915,
+        8041,
+        8042,
+        8131,
+        8132,
+        8229,
+        8293,
+        8310,
+        8325,
+        8326,
+        8327,
+        8328,
+        8329,
+        8330,
+        8331,
+        8332,
+        8408,
+        8412,
+        8526,
+        8530,
+        8536,
+        8537,
+        8548,
+        8551,
+        8563,
+        8618,
+        8676,
+        8823,
+        8843,
+        8971,
+        9184,
+        9185,
+        9186,
+        9187,
+        9188,
+        9189,
+        9190,
+        9191,
+        9192,
+        9193,
+        10236,
+        10837,
+        10838,
+        11417,
+        11432,
+        11435,
+        11453,
+        11455,
+        11500,
+        11611,
+        11677,
+        11699,
+        11700,
+        12846,
+        12921,
+        12922,
+        13629,
+        13630,
+        16000,
+        16002,
+        16023,
+        16402,
+        16479,
+        16480,
+        16482,
+        16777,
+        17042,
+        17323,
+        17539,
+        17540,
+        18243,
+        19470,
+        19471,
+        19948,
+        19949,
+        19950,
+        19951,
+        19952,
+        19953,
+        19954,
+        19955,
+        19956,
+        19957,
+        19958,
+        19959,
+        19960,
+        19961,
+        19962,
+        19963,
+        19964,
+        19965,
+        19966,
+        19967,
+        19968,
+        19969,
+        19970,
+        19971,
+        19972,
+        19973,
+        19974,
+        19975,
+        19976,
+        19977,
+        19978,
+        19979,
+        19980,
+        19981,
+        19982,
+        19983,
+        19984,
+        19985,
+        19986,
+        19987,
+        19988,
+        19989,
+        19990,
+        19991,
+        19992
+    },
+    ["Клубы"] = {
+        2780,
+        14539,
+        14540,
+        14809,
+        14810,
+        14811,
+        14829,
+        14830,
+        14832,
+        14833,
+        14835,
+        14836,
+        14837,
+        14839,
+        18102
+    },
+    ["Пикапы"] = {
+        954,
+        1210,
+        1212,
+        1213,
+        1239,
+        1240,
+        1241,
+        1242,
+        1247,
+        1248,
+        1252,
+        1253,
+        1254,
+        1272,
+        1273,
+        1274,
+        1275,
+        1276,
+        1277,
+        1279,
+        1310,
+        1313,
+        1314,
+        1318,
+        1550,
+        1559,
+        1575,
+        1576,
+        1577,
+        1578,
+        1579,
+        1580,
+        1650,
+        1654,
+        2710,
+        2782,
+        2891,
+        3096,
+        18631,
+        19130,
+        19131,
+        19132,
+        19133,
+        19134,
+        19135,
+        19197,
+        19198,
+        19522,
+        19523,
+        19524,
+        19605,
+        19606,
+        19607,
+        19902,
+        19945,
+        19946,
+        19947
+    },
+    ["Свет"] = {
+        18641,
+        18643,
+        18647,
+        18648,
+        18649,
+        18650,
+        18651,
+        18652,
+        18653,
+        18654,
+        18655,
+        18656,
+        18657,
+        18658,
+        18876,
+        19080,
+        19081,
+        19082,
+        19083,
+        19084,
+        19121,
+        19122,
+        19123,
+        19124,
+        19125,
+        19126,
+        19127,
+        19143,
+        19144,
+        19145,
+        19146,
+        19147,
+        19148,
+        19149,
+        19150,
+        19151,
+        19152,
+        19153,
+        19154,
+        19155,
+        19156,
+        19279,
+        19280,
+        19281,
+        19282,
+        19283,
+        19284,
+        19285,
+        19286,
+        19287,
+        19288,
+        19289,
+        19290,
+        19291,
+        19292,
+        19293,
+        19294,
+        19295,
+        19296,
+        19297,
+        19298,
+        19299
+    },
+    ["Ферма"] = {
+        451,
+        452,
+        453,
+        454,
+        458,
+        479,
+        480,
+        482,
+        483,
+        638,
+        2901,
+        3241,
+        3242,
+        3246,
+        3249,
+        3250,
+        3252,
+        3253,
+        3260,
+        3261,
+        3283,
+        3284,
+        3285,
+        3292,
+        3293,
+        3297,
+        3298,
+        3299,
+        3300,
+        3301,
+        3302,
+        3355,
+        3356,
+        3357,
+        3358,
+        3359,
+        3360,
+        3362,
+        3363,
+        3364,
+        3365,
+        3366,
+        3371,
+        3372,
+        3373,
+        3374,
+        3402,
+        3403,
+        3404,
+        3405,
+        5299,
+        5300,
+        5836,
+        5838,
+        5926,
+        6005,
+        8940,
+        8941,
+        8942,
+        8943,
+        8944,
+        9260,
+        1461,
+        1617,
+        1654,
+        2807,
+        2808,
+        2821,
+        2847,
+        2914,
+        2915,
+        2917,
+        2919,
+        2920,
+        3002,
+        3003,
+        3004,
+        3005,
+        3052,
+        3055,
+        3056,
+        3057,
+        3059,
+        3060,
+        3061,
+        3062,
+        3063,
+        3064,
+        3108,
+        3109,
+        3206,
+        3367,
+        3369,
+        3435,
+        4871,
+        4872,
+        4873,
+        4874,
+        4875,
+        4876,
+        6051,
+        6052,
+        6053,
+        6054,
+        6069,
+        6105,
+        6108,
+        6280,
+        6281,
+        6285,
+        6287,
+        6385,
+        6388,
+        6398,
+        6404,
+        6405,
+        6406,
+        6598,
+        6599,
+        6600,
+        6601,
+        7005,
+        7006,
+        7008,
+        7009,
+        7010,
+        7011,
+        7036,
+        7037,
+        7038,
+        7039,
+        7040,
+        7041,
+        7045,
+        7054,
+        7056,
+        7057,
+        7058,
+        7059,
+        7061,
+        7063,
+        7066,
+        7072,
+        7074,
+        7298,
+        7324,
+        7325,
+        7335,
+        7349,
+        7350,
+        7351,
+        7352,
+        7353,
+        7354,
+        7355,
+        7356,
+        8565,
+        8566,
+        8567,
+        8568,
+        8569,
+        8609,
+        8890,
+        9632,
+        9793,
+        9881
+    },
+    ["Железные дороги"] = {
+        2910,
+        3897,
+        4817,
+        4818,
+        4819,
+        4853,
+        4884,
+        4885,
+        4971,
+        5033,
+        5053,
+        5054,
+        5055,
+        5064,
+        5065,
+        5169,
+        5194,
+        5209,
+        5275,
+        5277,
+        5287,
+        5289,
+        5346,
+        5398,
+        5399,
+        5477,
+        5478,
+        5479,
+        5480,
+        5513,
+        5647,
+        5673,
+        5674,
+        5679,
+        5680,
+        5985,
+        6218,
+        6219,
+        6220,
+        6221,
+        6222,
+        6290,
+        6292,
+        6501,
+        6502,
+        6503,
+        6504,
+        6505,
+        6506,
+        6913,
+        6914,
+        6915,
+        6916,
+        6980,
+        6981,
+        6982,
+        6983,
+        6984,
+        7181,
+        7225,
+        7281,
+        7282,
+        7283,
+        7284,
+        7498,
+        7499,
+        7503,
+        7504,
+        7505,
+        7848,
+        8538,
+        8539,
+        8540,
+        8541,
+        8542,
+        8575,
+        8586,
+        8587,
+        8624,
+        8625,
+        8626,
+        8627,
+        8628,
+        8629,
+        8630,
+        8631,
+        8632,
+        8633,
+        8634,
+        8740,
+        8741,
+        8785,
+        8787,
+        8788,
+        8789,
+        8790,
+        8791,
+        8792,
+        8793,
+        8794,
+        8796,
+        8797,
+        8798,
+        8799,
+        8800,
+        8801,
+        8802,
+        8858,
+        8860,
+        8863,
+        8864,
+        8967,
+        8968,
+        9059,
+        10752,
+        10754,
+        10927,
+        10931,
+        10933,
+        10934,
+        10935,
+        10944,
+        10956,
+        10957,
+        11216,
+        11221,
+        11228,
+        11229,
+        11230,
+        11231,
+        11232,
+        11252,
+        11255,
+        11256,
+        11258,
+        11260,
+        11264,
+        11265,
+        11266,
+        11267,
+        11337,
+        11342,
+        11343,
+        11344,
+        11355,
+        11356,
+        11357,
+        11358,
+        11377,
+        11378,
+        11464,
+        11465,
+        11466,
+        11467,
+        11620,
+        11621,
+        11622,
+        12831,
+        12832,
+        12833,
+        12834,
+        12835,
+        12836,
+        12837,
+        12838,
+        13312,
+        13313,
+        13314,
+        13491,
+        13492,
+        16024,
+        16025,
+        16026,
+        16027,
+        16028,
+        16029,
+        16030,
+        16031,
+        16032,
+        16033,
+        16034,
+        16035,
+        16036,
+        16156,
+        16517,
+        16518,
+        16519,
+        16520,
+        16521,
+        16522,
+        16523,
+        16524,
+        16525,
+        16526,
+        16527,
+        16528,
+        16529,
+        16592,
+        17311,
+        17312,
+        17313,
+        17314,
+        17315,
+        17316,
+        17317,
+        17318,
+        17319,
+        17320,
+        17321,
+        17322
+    },
+    ["Магазины/рестораны"] = {
+        1780,
+        2415,
+        2416,
+        2417,
+        2418,
+        2419,
+        2421,
+        2428,
+        2429,
+        2439,
+        2440,
+        2453,
+        2456,
+        11709,
+        1513,
+        1842,
+        1843,
+        1844,
+        1845,
+        1847,
+        1848,
+        1849,
+        1850,
+        1883,
+        1884,
+        1887,
+        1888,
+        1889,
+        1890,
+        1891,
+        1948,
+        1972,
+        1973,
+        1981,
+        1982,
+        1983,
+        1984,
+        1986,
+        1987,
+        1988,
+        1990,
+        1991,
+        1992,
+        1993,
+        1994,
+        1995,
+        1996,
+        2012,
+        2360,
+        2361,
+        2362,
+        2363,
+        2364,
+        2365,
+        2367,
+        2369,
+        2374,
+        2375,
+        2376,
+        2379,
+        2385,
+        2403,
+        2413,
+        2414,
+        2423,
+        2424,
+        2425,
+        2426,
+        2427,
+        2433,
+        2436,
+        2441,
+        2442,
+        2444,
+        2445,
+        2448,
+        2449,
+        2451,
+        2457,
+        2458,
+        2459,
+        2460,
+        2461,
+        2462,
+        2463,
+        2467,
+        2475,
+        2535,
+        2536,
+        2537,
+        2538,
+        2539,
+        2540,
+        2541,
+        2542,
+        2543,
+        2544,
+        2545,
+        2546,
+        2547,
+        2548,
+        2549,
+        2550,
+        2551,
+        2552,
+        2553,
+        2554,
+        2555,
+        2556,
+        2557,
+        2577,
+        2578,
+        2579,
+        2581,
+        2582,
+        2583,
+        2584,
+        2586,
+        2625,
+        2871,
+        18042,
+        18047,
+        18070,
+        19640,
+        1349,
+        1445,
+        1514,
+        1572,
+        1665,
+        1885,
+        1892,
+        1893,
+        1959,
+        2371,
+        2372,
+        2373,
+        2377,
+        2378,
+        2380,
+        2381,
+        2382,
+        2383,
+        2384,
+        2386,
+        2387,
+        2388,
+        2389,
+        2390,
+        2391,
+        2392,
+        2393,
+        2394,
+        2395,
+        2396,
+        2397,
+        2398,
+        2399,
+        2400,
+        2401,
+        2402,
+        2407,
+        2408,
+        2409,
+        2411,
+        2412,
+        2420,
+        2422,
+        2430,
+        2431,
+        2432,
+        2437,
+        2438,
+        2464,
+        2465,
+        2466,
+        2468,
+        2469,
+        2470,
+        2471,
+        2472,
+        2473,
+        2474,
+        2476,
+        2477,
+        2478,
+        2479,
+        2480,
+        2481,
+        2482,
+        2483,
+        2484,
+        2485,
+        2486,
+        2487,
+        2488,
+        2489,
+        2490,
+        2491,
+        2492,
+        2493,
+        2494,
+        2495,
+        2496,
+        2497,
+        2498,
+        2499,
+        2500,
+        2501,
+        2502,
+        2503,
+        2504,
+        2505,
+        2506,
+        2507,
+        2508,
+        2509,
+        2510,
+        2511,
+        2512,
+        2513,
+        2580,
+        2585,
+        2587,
+        2588,
+        2593,
+        2594,
+        2597,
+        2598,
+        2599,
+        2620,
+        2621,
+        2622,
+        2623,
+        2624,
+        2641,
+        2642,
+        2643,
+        2645,
+        2646,
+        2650,
+        2651,
+        2652,
+        2654,
+        2655,
+        2656,
+        2657,
+        2658,
+        2659,
+        2660,
+        2661,
+        2662,
+        2664,
+        2665,
+        2666,
+        2667,
+        2668,
+        2682,
+        2684,
+        2685,
+        2686,
+        2687,
+        2688,
+        2689,
+        2691,
+        2692,
+        2693,
+        2694,
+        2695,
+        2696,
+        2697,
+        2698,
+        2699,
+        2701,
+        2704,
+        2705,
+        2706,
+        2714,
+        2715,
+        2716,
+        2717,
+        2719,
+        2720,
+        2721,
+        2722,
+        2726,
+        2727,
+        2728,
+        2729,
+        2730,
+        2731,
+        2732,
+        2733,
+        2734,
+        2735,
+        2736,
+        2753,
+        2765,
+        2766,
+        2767,
+        2770,
+        2771,
+        2775,
+        2781,
+        2941,
+        3966,
+        5814,
+        6002,
+        7610,
+        8396,
+        9314,
+        9527,
+        9528,
+        10310,
+        14678,
+        14679,
+        14686,
+        14693,
+        14739,
+        14854,
+        14855,
+        14856,
+        14890,
+        14891,
+        16153,
+        16154,
+        16155,
+        18002,
+        18016,
+        18034,
+        18035,
+        18039,
+        18041,
+        18043,
+        18044,
+        18046,
+        18048,
+        18050,
+        18052,
+        18053,
+        18054,
+        18061,
+        18062,
+        18063,
+        18064,
+        18066,
+        18067,
+        18069,
+        18083,
+        18094,
+        18104,
+        18105,
+        18109,
+        18112,
+        19326,
+        19327,
+        19328,
+        19329,
+        19587,
+        19592,
+        19876,
+        19877,
+        642,
+        643,
+        1432,
+        1594,
+        1679,
+        1968,
+        1969,
+        1970,
+        2027,
+        2626,
+        2635,
+        2638,
+        2639,
+        2644,
+        2723,
+        2724,
+        2725,
+        2746,
+        2747,
+        2748,
+        2762,
+        2763,
+        2764,
+        2776,
+        2777,
+        2788,
+        2799,
+        2801,
+        2802,
+        2807,
+        2808,
+        3922,
+        9822,
+        12842,
+        14650,
+        14653,
+        14657,
+        16152,
+        18003,
+        18019,
+        18055,
+        18057,
+        18059,
+        18060,
+        18077,
+        18081
+    },
+    ["Питьевые автоматы"] = {
+        955,
+        956,
+        1209,
+        1302,
+        1775,
+        1776,
+        1977,
+        2443,
+        2452,
+        2531,
+        2532,
+        2533
+    },
+    ["Эффекты"] = {
+        18668,
+        18669,
+        18670,
+        18671,
+        18672,
+        18673,
+        18674,
+        18675,
+        18676,
+        18677,
+        18678,
+        18679,
+        18680,
+        18681,
+        18682,
+        18683,
+        18684,
+        18685,
+        18686,
+        18687,
+        18688,
+        18689,
+        18690,
+        18691,
+        18692,
+        18693,
+        18694,
+        18695,
+        18696,
+        18697,
+        18698,
+        18699,
+        18700,
+        18701,
+        18702,
+        18703,
+        18704,
+        18705,
+        18706,
+        18707,
+        18708,
+        18709,
+        18710,
+        18711,
+        18712,
+        18713,
+        18714,
+        18715,
+        18716,
+        18717,
+        18718,
+        18719,
+        18720,
+        18721,
+        18722,
+        18723,
+        18724,
+        18725,
+        18726,
+        18727,
+        18728,
+        18729,
+        18730,
+        18731,
+        18732,
+        18733,
+        18734,
+        18735,
+        18736,
+        18737,
+        18738,
+        18739,
+        18740,
+        18741,
+        18742,
+        18743,
+        18744,
+        18745,
+        18746,
+        18747,
+        18748,
+        18863,
+        18864
+    }
+}
+
+------------------------------------------------------------
+-- РАЗДЕЛ FPS: удаление декоративных объектов по категориям
+------------------------------------------------------------
+-- Источник данных и идеи — сторонний скрипт FPS UP (список ID моделей
+-- по категориям + перехват RPC создания объекта). Перехватываем RPC 44
+-- (CreateObject) и, если модель попадает в одну из включённых категорий,
+-- отменяем создание объекта (return false из onReceiveRpc) — объект
+-- вообще не появляется в мире клиента, а не просто становится невидимым.
+-- Это дешевле по нагрузке, чем DestroyObject постфактум.
+-- ВАЖНО: Lua-функция не может иметь больше 60 upvalue. UI-рендер AXION —
+-- одна большая функция, и у неё уже много захваченных переменных. Поэтому
+-- всё состояние раздела FPS хранится в ОДНОМ table (FPS.*), а не в
+-- отдельных local-переменных — это даёт 1 upvalue вместо десятка.
+local FPS = {
+    objects_enabled = new.bool(false), -- общий рубильник REMOVE OBJECTS
+    removed_objects_count = 0,
+    category_toggles = {}, -- [имя категории] = new.bool(false)
+    active_model_set = {}, -- быстрый набор моделей для включённых категорий
+
+    distance_enabled = new.bool(false),
+    nametags_distance = new.int(15),
+    tdtext_distance = new.int(10),
+    chatbubbles_distance = new.int(8),
+    nametags_server_settings_ptr = nil,
+    nametags_allowed_distance = nil,
+
+    auto_unload_vehicles_enabled = new.bool(false),
+    vehicle_unload_distance = new.int(80),
+}
+for _, name in ipairs(FPS_CATEGORY_ORDER) do
+    FPS.category_toggles[name] = new.bool(false)
+end
+
+-- пересчитывается только при переключении чекбокса, а не на каждый объект
+local function fps_rebuild_active_model_set()
+    FPS.active_model_set = {}
+    for _, name in ipairs(FPS_CATEGORY_ORDER) do
+        if FPS.category_toggles[name][0] then
+            local list = FPS_OBJECT_CATEGORIES[name]
+            if list then
+                for _, model in ipairs(list) do
+                    FPS.active_model_set[model] = true
+                end
+            end
+        end
+    end
+end
+
+FPS.category_order = FPS_CATEGORY_ORDER
+FPS.rebuild_active_model_set = fps_rebuild_active_model_set
+
+function onReceiveRpc(id, bs)
+    if id == 44 and FPS.objects_enabled[0] and sampIsLocalPlayerSpawned() then
+        local okObjId, objId = pcall(raknetBitStreamReadInt16, bs)
+        local okModel, model = pcall(raknetBitStreamReadInt32, bs)
+        if okObjId and okModel and FPS.active_model_set[model] then
+            FPS.removed_objects_count = FPS.removed_objects_count + 1
+            return false -- отменяем создание объекта
+        end
+    end
+end
+
+-- АКТИВНОЕ СКАНИРОВАНИЕ уже существующих объектов -----------------------
+-- Блокировка через onReceiveRpc выше действует только на НОВЫЕ объекты —
+-- те, что были загружены/застримлены ДО включения REMOVE OBJECTS (или до
+-- захода в новую зону), она не трогает, поэтому удаление казалось очень
+-- медленным ("только при переезде по карте"). Этот поток догоняет их
+-- активно: проходит по всем текущим объектам мира (getAllObjects) и сразу
+-- удаляет те, что попадают в отмеченные категории.
+--
+-- ВАЖНО (фикс краша): на карте могут быть тысячи объектов. Обработка ВСЕХ
+-- разом в одной итерации без wait() — классическая причина краша в
+-- MoonLoader: скрипт слишком долго не отдаёт управление, и его убивает
+-- watchdog. Именно это происходило при "Выбрать всё" (сразу ~5500 моделей
+-- в фильтре -> тысячи совпадений разом). Поэтому обрабатываем ПОРЦИЯМИ
+-- с частым wait(0) внутри цикла, а не одним блоком между wait(1000).
+-- ЗНАЧИТЕЛЬНО безопаснее, чем было: маленькие порции (10 вместо 50) и
+-- реальная пауза 15мс между ними (не wait(0), который отдаёт управление
+-- лишь на долю кадра) — резкое удаление тысяч объектов разом (например,
+-- сразу после "Выбрать всё" на весь список категорий) может крашить саму
+-- игру, а не просто скрипт, если движок в этот момент ещё держит ссылки
+-- на эти объекты (рендер/коллизия/стриминг). Плюс лимит удалений за один
+-- проход цикла, чтобы никогда не сносить весь мир одним махом.
+local FPS_SCAN_CHUNK_SIZE = 10   -- объектов за одну порцию перед yield
+local FPS_SCAN_CHUNK_WAIT = 15   -- мс паузы между порциями
+local FPS_MAX_DELETIONS_PER_PASS = 300 -- максимум удалений за один полный проход
+
+lua_thread.create(function()
+    while true do
+        wait(1000)
+        if FPS.objects_enabled[0] and next(FPS.active_model_set) then
+            local okAll, allObjects = pcall(getAllObjects)
+            if okAll and allObjects then
+                local processed = 0
+                local deletedThisPass = 0
+                for _, obj in ipairs(allObjects) do
+                    if deletedThisPass >= FPS_MAX_DELETIONS_PER_PASS then
+                        break -- остаток доудалим на следующем проходе через 1с
+                    end
+
+                    local okExist, exists = pcall(doesObjectExist, obj)
+                    if okExist and exists then
+                        local okModel, model = pcall(getObjectModel, obj)
+                        if okModel and FPS.active_model_set[model] then
+                            local okDel = pcall(deleteObject, obj)
+                            if okDel then
+                                FPS.removed_objects_count = FPS.removed_objects_count + 1
+                                deletedThisPass = deletedThisPass + 1
+                            end
+                        end
+                    end
+                    processed = processed + 1
+                    if processed % FPS_SCAN_CHUNK_SIZE == 0 then
+                        wait(FPS_SCAN_CHUNK_WAIT) -- реальная пауза, не одна доля кадра
+                        -- если функцию выключили посреди сканирования — прерываемся
+                        if not FPS.objects_enabled[0] then break end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- РАЗДЕЛ FPS: дистанция неймтегов / 3D-текста / чат-баблов
+------------------------------------------------------------
+-- Урезание дистанции прорисовки неймтегов, 3D-текстов и чат-пузырей
+-- снижает число объектов, которые движок вообще пытается отрисовать
+-- в толпе игроков. Работает через нативный указатель настроек сервера
+-- (портируемо, в отличие от жёстко зашитых PC-адресов памяти) и через
+-- перехват SAMP-событий создания 3D-текста/чат-бабла.
+FPS.distance_enabled       = new.bool(false)
+FPS.nametags_distance      = new.int(15)   -- метры, дефолт большинства серверов ~30-40
+FPS.tdtext_distance        = new.int(10)
+FPS.chatbubbles_distance   = new.int(8)
+
+FPS.nametags_server_settings_ptr = nil
+FPS.nametags_allowed_distance    = nil
+
+local fps_nametags_diag_shown = false
+
+local function fps_apply_nametags_distance()
+    if not FPS.distance_enabled[0] then return end
+
+    if not FPS.nametags_server_settings_ptr then
+        local okPtr, ptr = pcall(sampGetServerSettingsPtr)
+        if okPtr and ptr and ptr ~= 0 then
+            FPS.nametags_server_settings_ptr = ptr + 39
+            local okMem, memory = pcall(require, 'memory')
+            if okMem then
+                local okGet, val = pcall(memory.getfloat, FPS.nametags_server_settings_ptr)
+                if okGet then FPS.nametags_allowed_distance = val end
+            end
+        elseif sampAddChatMessage and not fps_nametags_diag_shown then
+            fps_nametags_diag_shown = true
+            pcall(sampAddChatMessage,
+                '{FF6347}[AXION] LIMIT DISTANCE: sampGetServerSettingsPtr недоступен на этой сборке — дистанция неймтегов игроков не будет урезана (3D-текст и чат-баблы работают отдельно и не затронуты).', -1)
+        end
+    end
+
+    if FPS.nametags_server_settings_ptr then
+        local okMem, memory = pcall(require, 'memory')
+        if okMem then
+            local target = FPS.nametags_distance[0]
+            if FPS.nametags_allowed_distance and FPS.nametags_allowed_distance > 0
+               and target > FPS.nametags_allowed_distance then
+                target = FPS.nametags_allowed_distance
+            end
+            local okSet = pcall(memory.setfloat, FPS.nametags_server_settings_ptr, target)
+            if not okSet and sampAddChatMessage and not fps_nametags_diag_shown then
+                fps_nametags_diag_shown = true
+                pcall(sampAddChatMessage,
+                    '{FF6347}[AXION] LIMIT DISTANCE: запись в память не удалась на этой сборке.', -1)
+            end
+        end
+    end
+end
+
+FPS.tdtext_events_fired = 0
+FPS.chatbubble_events_fired = 0
+
+function sampev.onCreate3DText(id, col, pos, allowed_dist, los, plid, vehid, text)
+    if FPS.distance_enabled[0] then
+        FPS.tdtext_events_fired = FPS.tdtext_events_fired + 1
+        local custom = FPS.tdtext_distance[0]
+        if custom < allowed_dist then
+            return { id, col, pos, custom, los, plid, vehid, text }
+        end
+    end
+end
+
+function sampev.onPlayerChatBubble(id, col, allowed_dist, dur, text)
+    if FPS.distance_enabled[0] then
+        FPS.chatbubble_events_fired = FPS.chatbubble_events_fired + 1
+        local custom = FPS.chatbubbles_distance[0]
+        if custom < allowed_dist then
+            return { id, col, custom, dur, text }
+        end
+    end
+end
+
+lua_thread.create(function()
+    while true do
+        wait(1000) -- дистанция не требует мгновенной реакции, раз в секунду достаточно
+        if FPS.distance_enabled[0] then
+            pcall(fps_apply_nametags_distance)
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- РАЗДЕЛ FPS: авто-скрытие дальних машин по дистанции
+------------------------------------------------------------
+-- ПЕРЕДЕЛАНО: раньше использовало sampGetVehicleIdByCarHandle (сломанный
+-- опкод на Arizona/Android) + необратимую RPC-выгрузку. Теперь работает
+-- прямо с vehicle-хэндлом (getAllVehicles — нативно, надёжно) и переиспользует
+-- тот же механизм видимость+коллизия и ту же таблицу hidden_vehicles_handles,
+-- что и HIDE VEHICLES из RENDERING — так они не конфликтуют между собой.
+FPS.auto_unload_vehicles_enabled = new.bool(false)
+FPS.vehicle_unload_distance      = new.int(80)
+
+-- ключ отдельный от render_hide_vehicles, чтобы не путать источник скрытия:
+-- если одну и ту же машину скрыли и HIDE VEHICLES, и AUTO UNLOAD, снятие
+-- одной функции не должно возвращать видимость, если вторая всё ещё активна
+local fps_hidden_by_unload = {} -- [veh] = true, если скрыт именно этой функцией
+
+lua_thread.create(function()
+    while true do
+        wait(700)
+        if FPS.auto_unload_vehicles_enabled[0] then
+            local okPed, exists = pcall(doesCharExist, PLAYER_PED)
+            if okPed and exists then
+                local okPos, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+                if okPos then
+                    local okAll, allVehicles = pcall(getAllVehicles)
+                    if okAll and allVehicles then
+                        local seen = {}
+                        for _, veh in ipairs(allVehicles) do
+                            local okExist, vExists = pcall(doesVehicleExist, veh)
+                            if okExist and vExists then
+                                seen[veh] = true
+                                local okVPos, vx, vy, vz = pcall(getCarCoordinates, veh)
+                                if okVPos then
+                                    local dist = getDistanceBetweenCoords3d(px, py, pz, vx, vy, vz)
+                                    local tooFar = dist > FPS.vehicle_unload_distance[0]
+
+                                    if tooFar and not fps_hidden_by_unload[veh]
+                                       and not is_vehicle_protected_handle(veh) then
+                                        -- уехала далеко — скрываем
+                                        pcall(setCarVisible, veh, false)
+                                        pcall(setCarCollision, veh, false)
+                                        fps_hidden_by_unload[veh] = true
+                                        hidden_vehicles_handles[veh] = true
+                                    elseif not tooFar and fps_hidden_by_unload[veh] then
+                                        -- вернулись в радиус — восстанавливаем видимость,
+                                        -- НО только если её не скрывает ещё и HIDE VEHICLES
+                                        if not render_hide_vehicles_enabled[0] then
+                                            pcall(setCarVisible, veh, true)
+                                            pcall(setCarCollision, veh, true)
+                                            hidden_vehicles_handles[veh] = nil
+                                        end
+                                        fps_hidden_by_unload[veh] = nil
+                                    end
+                                end
+                            end
+                        end
+                        -- машина пропала из мира (выгружена стримингом) — забываем о ней,
+                        -- чтобы таблица не росла бесконечно
+                        for veh, _ in pairs(fps_hidden_by_unload) do
+                            if not seen[veh] then fps_hidden_by_unload[veh] = nil end
+                        end
+                    end
+                end
+            end
+        elseif next(fps_hidden_by_unload) then
+            -- функцию выключили — возвращаем видимость всем машинам, которые
+            -- скрыла именно она (если их не держит скрытыми ещё и HIDE VEHICLES)
+            for veh, _ in pairs(fps_hidden_by_unload) do
+                local okExist, exists = pcall(doesVehicleExist, veh)
+                if okExist and exists and not render_hide_vehicles_enabled[0] then
+                    pcall(setCarVisible, veh, true)
+                    pcall(setCarCollision, veh, true)
+                    hidden_vehicles_handles[veh] = nil
+                end
+            end
+            fps_hidden_by_unload = {}
+        end
+    end
+end)
+
+
+-- из отдельного адреса памяти, а не только из игрового стата. Рабочий
+-- способ (подтверждён рабочим сторонним скриптом) — нативная функция
+-- setPlayerNeverGetsTired, которая ставит флаг "никогда не устаёт" на
+-- уровне движка, а не просто разово подкручивает значение стата.
+-- Стат всё равно держим на максимуме как дополнительную подстраховку.
+lua_thread.create(function()
+    local was_enabled = false
+    while true do
+        wait(0)
+        if player_infinitesprint_enabled[0] then
+            if not was_enabled then
+                pcall(setPlayerNeverGetsTired, PLAYER_HANDLE, true)
+                was_enabled = true
+            end
+            local okExist, exists = pcall(doesCharExist, PLAYER_PED)
+            if okExist and exists then
+                pcall(setCharStat, PLAYER_PED, 22, 1000)
+            end
+        elseif was_enabled then
+            pcall(setPlayerNeverGetsTired, PLAYER_HANDLE, false)
+            was_enabled = false
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- ПОТОК: FREE CAM
+------------------------------------------------------------
+-- Управление — СВОЙ виртуальный джойстик, нарисованный прямо в окне AXION
+-- (см. UI ниже, переменная freecam_stick), а не игровой опкод — на этой
+-- сборке игровые виджеты (WIDGET_PED_MOVE и т.п.) оказались недоступны,
+-- поэтому рисуем собственный перетаскиваемый стик, который работает всегда.
+-- Поворот камеры — обычные свайпы (используем текущее направление игровой
+-- камеры, которое вы и так вращаете пальцем как всегда). Персонаж замирает
+-- на месте, а его координаты, отправляемые на сервер, подменяются на
+-- исходные, чтобы сервер не видел "телепорт" камеры.
+
+lua_thread.create(function()
+    local was_enabled = false
+
+    while true do
+        wait(0)
+
+        if player_freecam_enabled[0] then
+            if not was_enabled then
+                local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+                if okP and type(px) == 'number' then
+                    freecam_frozen_pos = { x = px, y = py, z = pz }
+                    freecam_pos.x, freecam_pos.y, freecam_pos.z = px, py, pz + 1.0
+                end
+
+                -- берём текущее направление игровой камеры как стартовое
+                local okFwd0, fx0, fy0 = pcall(getActiveCameraPointAt)
+                local okCam0, cx0, cy0 = pcall(getActiveCameraCoordinates)
+                if okFwd0 and okCam0 and fx0 and cx0 then
+                    freecam_yaw = math.deg(math.atan(fx0 - cx0, fy0 - cy0))
+                else
+                    freecam_yaw = 0
+                end
+                freecam_pitch = 0
+
+                pcall(freezeCharPosition, PLAYER_PED, true)
+                was_enabled = true
+            end
+
+            -- держим персонажа замороженным на зафиксированной точке
+            if freecam_frozen_pos then
+                pcall(setCharCoordinates, PLAYER_PED,
+                    freecam_frozen_pos.x, freecam_frozen_pos.y, freecam_frozen_pos.z)
+            end
+
+            -- ПОВОРОТ: свайпы — используем разницу текущего направления
+            -- игровой камеры относительно предыдущего кадра (пользователь
+            -- крутит её пальцем как обычно), просто переносим эту дельту
+            -- на угол полёта freecam.
+            local okFwd, camFx, camFy, camFz = pcall(getActiveCameraPointAt)
+            local okCamPos, camPx, camPy, camPz = pcall(getActiveCameraCoordinates)
+            if okFwd and camFx and okCamPos and camPx then
+                local dx, dy, dz = camFx - camPx, camFy - camPy, camFz - camPz
+                local lenXY = math.sqrt(dx*dx + dy*dy)
+                local len   = math.sqrt(dx*dx + dy*dy + dz*dz)
+                if len > 0 then
+                    freecam_yaw   = math.deg(math.atan(dx, dy))
+                    freecam_pitch = math.deg(math.atan(dz, math.max(lenXY, 0.0001)))
+                end
+            end
+
+            -- ДВИЖЕНИЕ: собственный виртуальный джойстик из UI
+            local jx, jy = freecam_stick.x, freecam_stick.y
+            local speed = FREECAM_MOVE_SPEED
+            if freecam_fast_mode then speed = speed * FREECAM_FAST_MULT end
+
+            local yawR = math.rad(freecam_yaw)
+            local fwdX, fwdY = math.sin(yawR), math.cos(yawR)
+            local rightX, rightY = math.cos(yawR), -math.sin(yawR)
+
+            -- jy < 0 обычно значит "вперёд" на большинстве джойстиков движения
+            freecam_pos.x = freecam_pos.x + (fwdX * (-jy) + rightX * jx) * speed
+            freecam_pos.y = freecam_pos.y + (fwdY * (-jy) + rightY * jx) * speed
+
+            -- отдельные кнопки вверх/вниз (зажатие) остаются для вертикали,
+            -- так как джойстик движения не даёт высоты
+            if flight_vertical_dir ~= 0 then
+                freecam_pos.z = freecam_pos.z + flight_vertical_dir * speed
+            end
+
+            -- применяем позицию и направление взгляда камеры
+            pcall(setFixedCameraPosition, freecam_pos.x, freecam_pos.y, freecam_pos.z, 0, 0, 0)
+            local pitchR = math.rad(freecam_pitch)
+            local lookDist = 10
+            local lookX = freecam_pos.x + fwdX * math.cos(pitchR) * lookDist
+            local lookY = freecam_pos.y + fwdY * math.cos(pitchR) * lookDist
+            local lookZ = freecam_pos.z + math.sin(pitchR) * lookDist
+            pcall(pointCameraAtPoint, lookX, lookY, lookZ, 2)
+
+        else
+            if was_enabled then
+                pcall(freezeCharPosition, PLAYER_PED, false)
+                pcall(restoreCameraJumpcut)
+                freecam_frozen_pos = nil
+                was_enabled = false
+            end
+        end
+    end
+end)
+
+-- Подменяем координаты в исходящем пакете синхронизации, пока FreeCam включён,
+-- чтобы сервер продолжал видеть игрока на замороженной точке, а не считал,
+-- что произошёл телепорт/спидхак из-за перемещения камеры.
+if sampev.onSendPlayerSync == nil then
+    function sampev.onSendPlayerSync(data)
+        if player_freecam_enabled[0] and freecam_frozen_pos and data and data.position then
+            data.position.x = freecam_frozen_pos.x
+            data.position.y = freecam_frozen_pos.y
+            data.position.z = freecam_frozen_pos.z
+            return data
+        end
+    end
+else
+    local prev_onSendPlayerSync = sampev.onSendPlayerSync
+    function sampev.onSendPlayerSync(data)
+        if player_freecam_enabled[0] and freecam_frozen_pos and data and data.position then
+            data.position.x = freecam_frozen_pos.x
+            data.position.y = freecam_frozen_pos.y
+            data.position.z = freecam_frozen_pos.z
+        end
+        return prev_onSendPlayerSync(data)
+    end
+end
+
+------------------------------------------------------------
+-- ВИЗУАЛЬНЫЙ СТИЛЬ (тёмная тема со скруглениями, под AXION)
+------------------------------------------------------------
+
+imgui.OnInitialize(function()
+    imgui.SwitchContext()
+
+    local style = imgui.GetStyle()
+    local c = style.Colors
+    local Col = imgui.Col
+
+    style.WindowRounding    = ROUNDING
+    style.ChildRounding     = ROUNDING
+    style.FrameRounding     = ROUNDING - 2
+    style.PopupRounding     = ROUNDING
+    style.ScrollbarRounding = ROUNDING
+    style.GrabRounding      = ROUNDING - 2
+    style.TabRounding       = ROUNDING - 2
+    style.WindowBorderSize  = 1
+    style.FrameBorderSize   = 0
+    style.ItemSpacing       = imgui.ImVec2(10, 8)
+    style.WindowPadding     = imgui.ImVec2(14, 14)
+    style.FramePadding      = imgui.ImVec2(10, 6)
+
+    c[Col.WindowBg]             = imgui.ImVec4(0.08, 0.07, 0.11, 0.97)
+    c[Col.ChildBg]              = imgui.ImVec4(0.10, 0.09, 0.14, 1.00)
+    c[Col.PopupBg]              = imgui.ImVec4(0.09, 0.08, 0.13, 0.98)
+    c[Col.TitleBg]              = imgui.ImVec4(0.10, 0.08, 0.15, 1.00)
+    c[Col.TitleBgActive]        = imgui.ImVec4(0.13, 0.10, 0.19, 1.00)
+    c[Col.FrameBg]              = imgui.ImVec4(0.15, 0.13, 0.20, 1.00)
+    c[Col.FrameBgHovered]       = imgui.ImVec4(0.22, 0.17, 0.30, 1.00)
+    c[Col.FrameBgActive]        = imgui.ImVec4(0.26, 0.20, 0.36, 1.00)
+    c[Col.Button]               = imgui.ImVec4(0.35, 0.20, 0.55, 1.00)
+    c[Col.ButtonHovered]        = imgui.ImVec4(0.45, 0.27, 0.70, 1.00)
+    c[Col.ButtonActive]         = imgui.ImVec4(0.28, 0.16, 0.45, 1.00)
+    c[Col.CheckMark]            = imgui.ImVec4(0.70, 0.45, 1.00, 1.00)
+    c[Col.SliderGrab]           = imgui.ImVec4(0.55, 0.32, 0.85, 1.00)
+    c[Col.SliderGrabActive]     = imgui.ImVec4(0.68, 0.42, 1.00, 1.00)
+    c[Col.ScrollbarBg]          = imgui.ImVec4(0.08, 0.07, 0.11, 1.00)
+    c[Col.ScrollbarGrab]        = imgui.ImVec4(0.32, 0.22, 0.45, 1.00)
+    c[Col.ScrollbarGrabHovered] = imgui.ImVec4(0.42, 0.28, 0.60, 1.00)
+    c[Col.Header]               = imgui.ImVec4(0.35, 0.20, 0.55, 0.65)
+    c[Col.HeaderHovered]        = imgui.ImVec4(0.45, 0.27, 0.70, 0.80)
+    c[Col.HeaderActive]         = imgui.ImVec4(0.40, 0.24, 0.62, 0.90)
+    c[Col.Separator]            = imgui.ImVec4(0.24, 0.20, 0.30, 1.00)
+    c[Col.Text]                 = imgui.ImVec4(0.92, 0.91, 0.95, 1.00)
+    c[Col.TextDisabled]         = imgui.ImVec4(0.50, 0.48, 0.56, 1.00)
+end)
+
+------------------------------------------------------------
+-- ИНТЕРФЕЙС (главное окно AXION)
+------------------------------------------------------------
+
+-- рисует виртуальный джойстик (перетаскиваемая ручка в круге) и записывает
+-- значение в stick_ref.x/y ([-1..1]); id_str должен быть уникальным для
+-- каждого места использования (Free Cam/No Clip/Jetpack — разные джойстики)
+local function draw_virtual_stick(id_str, stick_ref)
+    local STICK_SIZE  = 160
+    local KNOB_RADIUS = 28
+    local avail_w = imgui.GetWindowWidth() - imgui.GetStyle().WindowPadding.x * 2
+    local stick_cursor = imgui.GetCursorScreenPos()
+    local center_x = stick_cursor.x + avail_w / 2
+    local center_y = stick_cursor.y + STICK_SIZE / 2
+
+    imgui.InvisibleButton(u8('##stick_' .. id_str), imgui.ImVec2(avail_w, STICK_SIZE))
+    local stick_active = imgui.IsItemActive()
+
+    local draw_list = imgui.GetWindowDrawList()
+    draw_list:AddCircleFilled(imgui.ImVec2(center_x, center_y), STICK_SIZE / 2,
+        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.12, 0.10, 0.18, 1.0)))
+    draw_list:AddCircle(imgui.ImVec2(center_x, center_y), STICK_SIZE / 2,
+        imgui.ColorConvertFloat4ToU32(imgui.ImVec4(ACCENT[1], ACCENT[2], ACCENT[3], 0.6)), 0, 2.0)
+
+    if stick_active then
+        local mp = imgui.GetMousePos()
+        local dx, dy = mp.x - center_x, mp.y - center_y
+        local dist = math.sqrt(dx*dx + dy*dy)
+        local maxDist = STICK_SIZE / 2 - KNOB_RADIUS / 2
+        if dist > maxDist and dist > 0 then
+            dx, dy = dx / dist * maxDist, dy / dist * maxDist
+        end
+        stick_ref.x = dx / maxDist
+        stick_ref.y = dy / maxDist
+
+        local knob_x, knob_y = center_x + dx, center_y + dy
+        draw_list:AddCircleFilled(imgui.ImVec2(knob_x, knob_y), KNOB_RADIUS / 2,
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(ACCENT[1], ACCENT[2], ACCENT[3], 1.0)))
+    else
+        -- отпустили — стик возвращается в центр, движение прекращается
+        stick_ref.x, stick_ref.y = 0, 0
+        draw_list:AddCircleFilled(imgui.ImVec2(center_x, center_y), KNOB_RADIUS / 2,
+            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.5, 0.45, 0.6, 0.8)))
+    end
+
+    imgui.Dummy(imgui.ImVec2(0, STICK_SIZE + 6))
+end
+
+-- рисует блок настроек ESP (чекбоксы + дистанция + размер линий + цвет) для под-вкладок PLAYERS/CARS
+local function draw_esp_generic_settings(id_prefix, enabled_ref, lines_ref, box_ref, box_label, distance_ref, lines_size_ref, color_ref)
+    imgui.Checkbox(u8('ESP##' .. id_prefix), enabled_ref)
+    imgui.SameLine(0, 24)
+    imgui.Checkbox(u8('LINES##' .. id_prefix), lines_ref)
+    imgui.SameLine(0, 24)
+    imgui.Checkbox(u8(box_label .. '##' .. id_prefix), box_ref)
+
+    imgui.Spacing()
+
+    imgui.PushItemWidth(-1)
+    imgui.Text(u8'ESP DISTANCE')
+    imgui.SliderFloat(u8('##' .. id_prefix .. '_distance'), distance_ref, 5.0, 300.0, '%.0f m')
+
+    imgui.Text(u8'ESP LINES SIZE')
+    imgui.SliderFloat(u8('##' .. id_prefix .. '_lines_size'), lines_size_ref, 0.5, 6.0, '%.1f')
+    imgui.PopItemWidth()
+
+    imgui.Spacing()
+    imgui.Text(u8'ESP LINES COLOR')
+    imgui.SameLine()
+    if imgui.ColorButton(u8('##' .. id_prefix .. '_color_btn'),
+        imgui.ImVec4(color_ref[0], color_ref[1], color_ref[2], color_ref[3]),
+        0, imgui.ImVec2(28, 20)) then
+        imgui.OpenPopup(u8(id_prefix .. '_color_popup'))
+    end
+
+    if imgui.BeginPopup(u8(id_prefix .. '_color_popup')) then
+        imgui.ColorPicker4(u8'##picker', color_ref)
+        if imgui.Button(u8'OK', imgui.ImVec2(90, 0)) then
+            imgui.CloseCurrentPopup()
+        end
+        imgui.SameLine()
+        if imgui.Button(u8'CANCEL', imgui.ImVec2(90, 0)) then
+            imgui.CloseCurrentPopup()
+        end
+        imgui.EndPopup()
+    end
+end
+
+imgui.OnFrame(
+    function() return main_window_state[0] end,
+    function()
+        imgui.SetNextWindowSize(imgui.ImVec2(480, 560), imgui.Cond.FirstUseEver)
+        imgui.Begin(u8'AXION', main_window_state)
+
+        -- заголовок по центру
+        do
+            local title = u8'AXION'
+            local avail = imgui.GetWindowWidth()
+            local text_w = imgui.CalcTextSize(title).x
+            imgui.SetCursorPosX((avail - text_w) * 0.5)
+            imgui.TextColored(imgui.ImVec4(ACCENT[1], ACCENT[2], ACCENT[3], 1.0), title)
+        end
+
+        imgui.Separator()
+        imgui.Spacing()
+
+        -- разделы верхнего уровня: ESP / PLAYER / FPS / RENDERING / SETTINGS / INFO
+        local top_w = (imgui.GetWindowWidth() - imgui.GetStyle().WindowPadding.x * 2 - imgui.GetStyle().ItemSpacing.x * (#TOP_SECTIONS - 1)) / #TOP_SECTIONS
+        for i, section in ipairs(TOP_SECTIONS) do
+            if i > 1 then imgui.SameLine() end
+            local is_active = active_section == section
+            if is_active then
+                imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(ACCENT[1], ACCENT[2], ACCENT[3], 1.0))
+                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(ACCENT[1]+0.1, ACCENT[2]+0.05, ACCENT[3], 1.0))
+            else
+                imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0.18, 0.16, 0.26, 1.0))
+                imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.28, 0.20, 0.40, 1.0))
+            end
+            if imgui.Button(u8(section), imgui.ImVec2(top_w, 28)) then
+                active_section = section
+            end
+            imgui.PopStyleColor(2)
+        end
+
+        imgui.Spacing()
+        imgui.Separator()
+        imgui.Spacing()
+
+        if active_section == 'ESP' then
+            -- под-разделы OBJECTS / PLAYERS / CARS
+            local pad = imgui.GetStyle().WindowPadding.x
+            local spacing = imgui.GetStyle().ItemSpacing.x
+            local sub_w = (imgui.GetWindowWidth() - pad * 2 - spacing * 2) / 3
+
+            local ESP_SUBTABS = { 'OBJECTS', 'PLAYERS', 'CARS' }
+            for i, key in ipairs(ESP_SUBTABS) do
+                if i > 1 then imgui.SameLine() end
+                local is_active = esp_subtab == key
+                if is_active then
+                    imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(ACCENT[1], ACCENT[2], ACCENT[3], 1.0))
+                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(ACCENT[1]+0.1, ACCENT[2]+0.05, ACCENT[3], 1.0))
+                else
+                    imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0.18, 0.16, 0.26, 1.0))
+                    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.28, 0.20, 0.40, 1.0))
+                end
+                if imgui.Button(u8(key), imgui.ImVec2(sub_w, 30)) then
+                    esp_subtab = key
+                end
+                imgui.PopStyleColor(2)
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            if esp_subtab == 'OBJECTS' then
+                -- поле ввода Model ID + название + кнопка добавления
+                imgui.PushItemWidth(110)
+                imgui.InputText(u8'##model_id', new_object_model, 16)
+                imgui.PopItemWidth()
+
+                imgui.SameLine()
+                imgui.PushItemWidth(150)
+                imgui.InputText(u8'##obj_name', new_object_name, 32)
+                imgui.PopItemWidth()
+
+                imgui.SameLine()
+                imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(ACCENT[1], ACCENT[2], ACCENT[3], 1.0))
+                if imgui.Button(u8' + ') then
+                    add_object_to_list()
+                end
+                imgui.PopStyleColor()
+
+                imgui.Spacing()
+                imgui.Separator()
+                imgui.Spacing()
+
+                draw_esp_generic_settings('obj', esp_enabled, esp_lines_enabled, esp_dot_enabled, 'DOT',
+                    esp_distance, esp_lines_size, esp_lines_color)
+
+                imgui.Spacing()
+                imgui.Separator()
+                imgui.Spacing()
+
+                imgui.Text(u8'Список объектов')
+                imgui.PushStyleColor(imgui.Col.ChildBg, imgui.ImVec4(0.06, 0.05, 0.09, 1.0))
+                if imgui.BeginChild(u8'##objects_list_child', imgui.ImVec2(0, 140), true) then
+                    local to_remove = nil
+                    for i, obj in ipairs(esp_objects_list) do
+                        local label = obj.name or (u8'Объект ' .. tostring(obj.model))
+                        imgui.Text(label)
+                        imgui.SameLine(imgui.GetWindowWidth() - 42)
+                        if imgui.SmallButton(u8'x##obj_' .. i) then
+                            to_remove = i
+                        end
+                    end
+                    if to_remove then remove_object_from_list(to_remove) end
+                end
+                imgui.EndChild()
+                imgui.PopStyleColor()
+
+            elseif esp_subtab == 'PLAYERS' then
+                draw_esp_generic_settings('plr', esp_players_enabled, esp_players_lines_enabled, esp_players_box_enabled, 'BOX',
+                    esp_players_distance, esp_players_lines_size, esp_players_color)
+
+            elseif esp_subtab == 'CARS' then
+                -- поле ввода Model ID + название + кнопка добавления
+                imgui.PushItemWidth(110)
+                imgui.InputText(u8'##car_model_id', new_car_model, 16)
+                imgui.PopItemWidth()
+
+                imgui.SameLine()
+                imgui.PushItemWidth(150)
+                imgui.InputText(u8'##car_name', new_car_name, 32)
+                imgui.PopItemWidth()
+
+                imgui.SameLine()
+                imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(ACCENT[1], ACCENT[2], ACCENT[3], 1.0))
+                if imgui.Button(u8' + ') then
+                    local model_str = bufToStr(new_car_model, 16)
+                    local model_num = tonumber(model_str)
+                    if model_num then
+                        local name_str = bufToStr(new_car_name, 32)
+                        if name_str == '' then name_str = nil end
+                        table.insert(esp_cars_list, { model = math.floor(model_num), name = name_str })
+                        new_car_model[0] = 0
+                        new_car_name[0]  = 0
+                    end
+                end
+                imgui.PopStyleColor()
+
+                imgui.Spacing()
+                imgui.Separator()
+                imgui.Spacing()
+
+                draw_esp_generic_settings('car', esp_cars_enabled, esp_cars_lines_enabled, esp_cars_box_enabled, 'BOX',
+                    esp_cars_distance, esp_cars_lines_size, esp_cars_color)
+
+                imgui.Spacing()
+                imgui.Separator()
+                imgui.Spacing()
+
+                imgui.Text(u8'Список машин')
+                imgui.PushStyleColor(imgui.Col.ChildBg, imgui.ImVec4(0.06, 0.05, 0.09, 1.0))
+                if imgui.BeginChild(u8'##cars_list_child', imgui.ImVec2(0, 140), true) then
+                    local to_remove = nil
+                    for i, car in ipairs(esp_cars_list) do
+                        local label = car.name or (u8'Машина ' .. tostring(car.model))
+                        imgui.Text(label)
+                        imgui.SameLine(imgui.GetWindowWidth() - 42)
+                        if imgui.SmallButton(u8'x##car_' .. i) then
+                            to_remove = i
+                        end
+                    end
+                    if to_remove then table.remove(esp_cars_list, to_remove) end
+                end
+                imgui.EndChild()
+                imgui.PopStyleColor()
+            end
+
+        elseif active_section == 'PLAYER' then
+            -- AUTO RECONNECT -------------------------------------------------
+            if imgui.Checkbox(u8'AUTO RECONNECT', player_autoreconnect_enabled) then
+                -- при включении сразу считаем текущий сеанс "подключённым",
+                -- чтобы реконнект не сработал сразу же ошибочно
+                if player_autoreconnect_enabled[0] then
+                    local okAvail, available = pcall(isSampAvailable)
+                    player_was_connected_once = okAvail and available or false
+                end
+            end
+
+            if player_autoreconnect_enabled[0] then
+                imgui.Indent(14)
+                imgui.PushItemWidth(-1)
+                imgui.Text(u8'Пароль для авто-входа:')
+                local okPassFlag, passFlag = pcall(function() return imgui.InputTextFlags.Password end)
+                if okPassFlag and passFlag then
+                    imgui.InputText(u8'##reconnect_password', player_reconnect_password, 64, passFlag)
+                else
+                    imgui.InputText(u8'##reconnect_password', player_reconnect_password, 64)
+                end
+                imgui.PopItemWidth()
+                imgui.Unindent(14)
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- FREE CAM ---------------------------------------------------------
+            imgui.Checkbox(u8'FREE CAM', player_freecam_enabled)
+            if player_freecam_enabled[0] and player_noclip_enabled[0] then
+                player_noclip_enabled[0] = false
+            end
+            if player_freecam_enabled[0] and player_jetpack_enabled[0] then
+                player_jetpack_enabled[0] = false
+            end
+
+            if player_freecam_enabled[0] then
+                imgui.Indent(14)
+                imgui.Spacing()
+                if imgui.Button(u8(freecam_fast_mode and 'Ускорение: ВКЛ' or 'Ускорение: ВЫКЛ'), imgui.ImVec2(-1, 0)) then
+                    freecam_fast_mode = not freecam_fast_mode
+                end
+
+                imgui.Unindent(14)
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- GOD MODE -----------------------------------------------------
+            imgui.Checkbox(u8'GOD MODE (неуязвимость)', player_godmode_enabled)
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- TELEPORT TO WAYPOINT -------------------------------------------
+            imgui.Text(u8'TELEPORT TO WAYPOINT')
+            if imgui.Button(u8'ТЕЛЕПОРТ К МЕТКЕ', imgui.ImVec2(-1, 36)) then
+                local okBlip, hasBlip, bx, by, bz = pcall(getTargetBlipCoordinates)
+                if okBlip and hasBlip then
+                    teleport_waypoint_request = { x = bx, y = by, z = bz }
+                    teleport_last_status = u8'Телепорт...'
+                else
+                    teleport_last_status = u8'Метка на карте не найдена.'
+                end
+            end
+            if teleport_last_status ~= '' then
+                imgui.TextDisabled(teleport_last_status)
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- SPEED HACK -----------------------------------------------------
+            imgui.Checkbox(u8'SPEED HACK', player_speedhack_enabled)
+            if player_speedhack_enabled[0] then
+                imgui.Indent(14)
+                imgui.PushItemWidth(-1)
+                imgui.SliderFloat(u8'##speedhack_mult', player_speedhack_mult, 1.0, 5.0, u8'Множитель: %.1fx')
+                imgui.PopItemWidth()
+                imgui.Unindent(14)
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- TELEPORT TO PLAYER -----------------------------------------------
+            imgui.Text(u8'TELEPORT TO PLAYER')
+            imgui.PushItemWidth(-1)
+            imgui.InputInt(u8'##teleport_player_id', teleport_player_id)
+            imgui.PopItemWidth()
+            if imgui.Button(u8'ТЕЛЕПОРТ К ИГРОКУ', imgui.ImVec2(-1, 36)) then
+                teleport_player_request = teleport_player_id[0]
+                teleport_player_status = u8'Телепорт...'
+            end
+            if teleport_player_status ~= '' then
+                imgui.TextDisabled(teleport_player_status)
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- NO CLIP ----------------------------------------------------------
+            imgui.Checkbox(u8'NO CLIP (сквозь стены)', player_noclip_enabled)
+            if player_noclip_enabled[0] and player_freecam_enabled[0] then
+                player_freecam_enabled[0] = false
+            end
+            if player_noclip_enabled[0] and player_jetpack_enabled[0] then
+                player_jetpack_enabled[0] = false
+            end
+            if player_noclip_enabled[0] then
+                imgui.Indent(14)
+                imgui.Spacing()
+                if imgui.Button(u8(noclip_fast_mode and 'Ускорение: ВКЛ' or 'Ускорение: ВЫКЛ'), imgui.ImVec2(-1, 0)) then
+                    noclip_fast_mode = not noclip_fast_mode
+                end
+                imgui.Unindent(14)
+            else
+                noclip_move_up, noclip_move_down = false, false
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- JETPACK ------------------------------------------------------------
+            imgui.Checkbox(u8'JETPACK', player_jetpack_enabled)
+            if player_jetpack_enabled[0] and player_freecam_enabled[0] then
+                player_freecam_enabled[0] = false
+            end
+            if player_jetpack_enabled[0] and player_noclip_enabled[0] then
+                player_noclip_enabled[0] = false
+            end
+            if player_jetpack_enabled[0] then
+                imgui.Indent(14)
+                imgui.Spacing()
+                if imgui.Button(u8(jetpack_fast_mode and 'Ускорение: ВКЛ' or 'Ускорение: ВЫКЛ'), imgui.ImVec2(-1, 0)) then
+                    jetpack_fast_mode = not jetpack_fast_mode
+                end
+                imgui.Unindent(14)
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- INFINITE SPRINT ----------------------------------------------------
+            imgui.Checkbox(u8'INFINITE SPRINT (бесконечная выносливость)', player_infinitesprint_enabled)
+            if player_infinitesprint_enabled[0] then
+                imgui.Indent(14)
+                imgui.Unindent(14)
+            end
+
+        elseif active_section == 'FPS' then
+            -- УДАЛЕНИЕ ДЕКОРАТИВНЫХ ОБЪЕКТОВ ПО КАТЕГОРИЯМ ----------------------
+            imgui.Checkbox(u8'REMOVE OBJECTS (удаление декора по категориям)', FPS.objects_enabled)
+            imgui.SameLine()
+            imgui.TextColored(imgui.ImVec4(0.6, 0.6, 0.65, 1.0),
+                u8('Удалено: ' .. tostring(FPS.removed_objects_count)))
+
+            if FPS.objects_enabled[0] then
+                imgui.Spacing()
+                imgui.TextDisabled(u8'Отметь категории объектов, которые не нужно рисовать:')
+                imgui.Spacing()
+
+                if imgui.Button(u8'Выбрать всё', imgui.ImVec2(150, 0)) then
+                    for _, name in ipairs(FPS.category_order) do FPS.category_toggles[name][0] = true end
+                    FPS.rebuild_active_model_set()
+                end
+                imgui.SameLine()
+                if imgui.Button(u8'Снять всё', imgui.ImVec2(150, 0)) then
+                    for _, name in ipairs(FPS.category_order) do FPS.category_toggles[name][0] = false end
+                    FPS.rebuild_active_model_set()
+                end
+
+                imgui.Spacing()
+                if imgui.BeginChild(u8'##fps_categories', imgui.ImVec2(0, 220), true) then
+                    for _, name in ipairs(FPS.category_order) do
+                        if imgui.Checkbox(u8(name), FPS.category_toggles[name]) then
+                            FPS.rebuild_active_model_set()
+                        end
+                    end
+                end
+                imgui.EndChild()
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- ДИСТАНЦИЯ НЕЙМТЕГОВ / 3D-ТЕКСТА / ЧАТ-БАБЛОВ ----------------------
+            imgui.Checkbox(u8'LIMIT DISTANCE (неймтеги / 3D-текст / чат-баблы)', FPS.distance_enabled)
+            if FPS.distance_enabled[0] then
+                imgui.Indent(14)
+
+                imgui.TextDisabled(u8'Неймтеги игроков (м)')
+                imgui.SliderInt(u8'##fps_nametags_dist', FPS.nametags_distance, 3, 60, '%d m')
+
+                imgui.TextDisabled(u8'3D-текст (м)')
+                imgui.SliderInt(u8'##fps_tdtext_dist', FPS.tdtext_distance, 3, 40, '%d m')
+
+                imgui.TextDisabled(u8'Чат-баблы (м)')
+                imgui.SliderInt(u8'##fps_chatbubbles_dist', FPS.chatbubbles_distance, 3, 30, '%d m')
+
+                imgui.Spacing()
+                imgui.TextColored(imgui.ImVec4(0.55, 0.55, 0.6, 1.0),
+                    u8(string.format('Событий 3D-текста поймано: %d | чат-баблов: %d',
+                        FPS.tdtext_events_fired, FPS.chatbubble_events_fired)))
+                imgui.TextDisabled(u8'Если счётчики не растут при общении рядом с игроками — сервер не шлёт эти события в перехватываемом виде.')
+
+                imgui.Unindent(14)
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- АВТО-ВЫГРУЗКА ДАЛЬНИХ МАШИН ----------------------------------------
+            imgui.Checkbox(u8'AUTO UNLOAD VEHICLES (выгрузка дальних машин)', FPS.auto_unload_vehicles_enabled)
+            if FPS.auto_unload_vehicles_enabled[0] then
+                imgui.Indent(14)
+                imgui.TextDisabled(u8'Дистанция выгрузки (м)')
+                imgui.SliderInt(u8'##fps_veh_unload_dist', FPS.vehicle_unload_distance, 20, 300, '%d m')
+                imgui.TextDisabled(u8'Скрытые машины появятся снова, если подъехать ближе.')
+                imgui.Unindent(14)
+            end
+
+        elseif active_section == 'RENDERING' then
+            -- HIDE PLAYERS ---------------------------------------------------
+            imgui.Checkbox(u8'HIDE PLAYERS (скрытие для FPS)', render_hide_players_enabled)
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            -- HIDE VEHICLES ----------------------------------------------------
+            imgui.Checkbox(u8'HIDE VEHICLES (скрытие чужих машин)', render_hide_vehicles_enabled)
+            if render_hide_vehicles_enabled[0] then
+                imgui.Indent(14)
+                imgui.TextDisabled(u8'Полностью обратимо — восстанавливаются при выключении.')
+                imgui.Unindent(14)
+            end
+
+        elseif active_section == 'SETTINGS' then
+            imgui.TextDisabled(u8'Раздел SETTINGS будет добавлен следующим шагом.')
+
+        elseif active_section == 'INFO' then
+            imgui.TextDisabled(u8'Раздел INFO будет добавлен следующим шагом.')
+        end
+
+        imgui.End()
+    end
+)
+
+------------------------------------------------------------
+-- ПЛАВАЮЩИЙ ДЖОЙСТИК ПОЛЁТА (Free Cam / No Clip / Jetpack)
+------------------------------------------------------------
+-- Отдельное окно без рамки/заголовка, позиционированное там же, где обычно
+-- находится игровой тач-стик движения (нижний левый угол экрана) — так
+-- управление полётом не отвлекает от остального интерфейса и ощущается
+-- как обычный игровой джойстик. Показывается только когда активна одна
+-- из трёх функций полёта.
+--
+-- Логика зон:
+--  • ВНУТРИ круга — обычный джойстик движения (x = вправо/влево, y = вперёд/назад)
+--  • Вертикальная полоса СПРАВА от круга — свайп вверх/вниз меняет высоту
+--    полёта (соответствует привычному "потянул вверх — взлетел")
+
+-- Размеры элементов управления полётом
+local FLIGHT_STICK_SIZE = 180   -- диаметр круга джойстика
+local FLIGHT_VBAR_WIDTH = 52    -- ширина вертикальной полосы высоты
+local FLIGHT_VBAR_GAP   = 16    -- отступ между джойстиком и полосой
+
+-- Чувствительность поворота камеры: сколько градусов/сек при максимальном отклонении
+local FLIGHT_CAM_SENS = 90.0
+
+-- Накопленная дельта поворота камеры за кадр (применяется отдельным потоком)
+local flight_cam_yaw_delta = 0.0
+
+local function get_active_flight_stick()
+    if player_freecam_enabled[0] then return freecam_stick end
+    if player_noclip_enabled[0]  then return noclip_stick end
+    if player_jetpack_enabled[0] then return jetpack_stick end
+    return nil
+end
+
+-- Поток: применяем поворот камеры через heading персонажа.
+-- На Android/MonetLoader setCharHeading — единственный надёжный способ.
+lua_thread.create(function()
+    while true do
+        wait(0)
+        local is_flight = player_freecam_enabled[0] or player_noclip_enabled[0] or player_jetpack_enabled[0]
+        if is_flight and math.abs(flight_cam_yaw_delta) > 0.01 then
+            local okH, heading = pcall(getCharHeading, PLAYER_PED)
+            if okH and type(heading) == 'number' then
+                local newH = (heading + flight_cam_yaw_delta) % 360
+                pcall(setCharHeading, PLAYER_PED, newH)
+            end
+            flight_cam_yaw_delta = 0.0
+        end
+    end
+end)
+
+imgui.OnFrame(
+    function()
+        return player_freecam_enabled[0] or player_noclip_enabled[0] or player_jetpack_enabled[0]
+    end,
+    function()
+        local stick_ref = get_active_flight_stick()
+        if not stick_ref then return end
+
+        local screen_w, screen_h = 1280, 720
+        local okIO, io_ref = pcall(imgui.GetIO)
+        if okIO and io_ref and io_ref.DisplaySize then
+            screen_w, screen_h = io_ref.DisplaySize.x, io_ref.DisplaySize.y
+        end
+
+        local margin     = 26
+        local total_w    = FLIGHT_STICK_SIZE + FLIGHT_VBAR_GAP + FLIGHT_VBAR_WIDTH
+        local win_y      = screen_h - FLIGHT_STICK_SIZE - margin - 40
+
+        -- ЛЕВАЯ панель: джойстик
+        local left_x = margin
+        imgui.SetNextWindowPos(imgui.ImVec2(left_x, win_y), imgui.Cond.Always)
+        imgui.SetNextWindowSize(imgui.ImVec2(FLIGHT_STICK_SIZE, FLIGHT_STICK_SIZE), imgui.Cond.Always)
+        pcall(imgui.SetNextWindowBgAlpha, 0)
+
+        local function safe_flag(name)
+            local ok, val = pcall(function() return imgui.WindowFlags[name] end)
+            if ok and val then return val end
+            return 0
+        end
+        local base_flags = safe_flag('NoDecoration') + safe_flag('NoMove')
+            + safe_flag('NoScrollWithMouse') + safe_flag('NoSavedSettings')
+            + safe_flag('NoFocusOnAppearing') + safe_flag('NoNav')
+            + safe_flag('NoBackground')
+
+        imgui.Begin(u8'##flight_left_window', nil, base_flags)
+        local dl_left  = imgui.GetWindowDrawList()
+        local lpos     = imgui.GetWindowPos()
+
+        local col_accent  = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(ACCENT[1], ACCENT[2], ACCENT[3], 0.75))
+        local col_bg      = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.10, 0.09, 0.15, 0.55))
+        local col_knob    = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(ACCENT[1], ACCENT[2], ACCENT[3], 1.00))
+        local col_idle    = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.55, 0.50, 0.65, 0.75))
+        local col_hint    = imgui.ColorConvertFloat4ToU32(imgui.ImVec4(1, 1, 1, 0.50))
+
+        -- Круг джойстика
+        local cx = lpos.x + FLIGHT_STICK_SIZE / 2
+        local cy = lpos.y + FLIGHT_STICK_SIZE / 2
+        local radius  = FLIGHT_STICK_SIZE / 2 - 4
+        local knob_r  = 26
+
+        dl_left:AddCircleFilled(imgui.ImVec2(cx, cy), radius, col_bg)
+        dl_left:AddCircle(imgui.ImVec2(cx, cy), radius, col_accent, 0, 2.5)
+        -- крестик-подсказка направлений
+        dl_left:AddText(imgui.ImVec2(cx - 4, lpos.y + 6),        col_hint, u8'^')
+        dl_left:AddText(imgui.ImVec2(cx - 4, lpos.y + FLIGHT_STICK_SIZE - 22), col_hint, u8'v')
+        dl_left:AddText(imgui.ImVec2(lpos.x + 6, cy - 7),        col_hint, u8'<')
+        dl_left:AddText(imgui.ImVec2(lpos.x + FLIGHT_STICK_SIZE - 16, cy - 7), col_hint, u8'>')
+
+        imgui.SetCursorScreenPos(imgui.ImVec2(lpos.x, lpos.y))
+        imgui.InvisibleButton(u8'##flight_joystick', imgui.ImVec2(FLIGHT_STICK_SIZE, FLIGHT_STICK_SIZE))
+        local joy_active = imgui.IsItemActive()
+
+        if joy_active then
+            local mp   = imgui.GetMousePos()
+            local dx   = mp.x - cx
+            local dy   = mp.y - cy
+            local dist = math.sqrt(dx*dx + dy*dy)
+            local maxD = radius - knob_r / 2
+            if dist > maxD and dist > 0 then
+                dx, dy = dx / dist * maxD, dy / dist * maxD
+            end
+
+            stick_ref.x = dx / maxD   -- вправо/влево: движение
+            stick_ref.y = dy / maxD   -- вперёд/назад: движение
+
+            -- Поворот камеры пропорционален горизонтальному отклонению джойстика.
+            -- ~60 fps → delta per frame = sens * normalized_x / 60
+            flight_cam_yaw_delta = -stick_ref.x * FLIGHT_CAM_SENS / 60.0
+
+            dl_left:AddCircleFilled(imgui.ImVec2(cx + dx, cy + dy), knob_r, col_knob)
+        else
+            stick_ref.x, stick_ref.y = 0, 0
+            flight_cam_yaw_delta = 0.0
+            dl_left:AddCircleFilled(imgui.ImVec2(cx, cy), knob_r, col_idle)
+        end
+
+        imgui.End()
+
+        -- ПРАВАЯ панель: вертикальная полоса высоты
+        local right_x = screen_w - FLIGHT_VBAR_WIDTH - margin
+        imgui.SetNextWindowPos(imgui.ImVec2(right_x, win_y), imgui.Cond.Always)
+        imgui.SetNextWindowSize(imgui.ImVec2(FLIGHT_VBAR_WIDTH, FLIGHT_STICK_SIZE), imgui.Cond.Always)
+        pcall(imgui.SetNextWindowBgAlpha, 0)
+
+        imgui.Begin(u8'##flight_right_window', nil, base_flags)
+        local dl_right = imgui.GetWindowDrawList()
+        local rpos     = imgui.GetWindowPos()
+
+        local vbar_cx  = rpos.x + FLIGHT_VBAR_WIDTH / 2
+        local vbar_cy  = rpos.y + FLIGHT_STICK_SIZE / 2
+
+        dl_right:AddRectFilled(
+            imgui.ImVec2(rpos.x, rpos.y),
+            imgui.ImVec2(rpos.x + FLIGHT_VBAR_WIDTH, rpos.y + FLIGHT_STICK_SIZE),
+            col_bg, 10.0)
+        dl_right:AddRect(
+            imgui.ImVec2(rpos.x, rpos.y),
+            imgui.ImVec2(rpos.x + FLIGHT_VBAR_WIDTH, rpos.y + FLIGHT_STICK_SIZE),
+            col_accent, 10.0, nil, 2.0)
+        dl_right:AddText(imgui.ImVec2(vbar_cx - 4, rpos.y + 5),                   col_hint, u8'^')
+        dl_right:AddText(imgui.ImVec2(vbar_cx - 4, rpos.y + FLIGHT_STICK_SIZE - 20), col_hint, u8'v')
+
+        imgui.SetCursorScreenPos(imgui.ImVec2(rpos.x, rpos.y))
+        imgui.InvisibleButton(u8'##flight_vbar', imgui.ImVec2(FLIGHT_VBAR_WIDTH, FLIGHT_STICK_SIZE))
+        local vbar_active = imgui.IsItemActive()
+
+        if vbar_active then
+            local mp  = imgui.GetMousePos()
+            local rel = (mp.y - vbar_cy) / (FLIGHT_STICK_SIZE / 2)
+            if rel < -0.15 then
+                flight_vertical_dir = 1
+            elseif rel > 0.15 then
+                flight_vertical_dir = -1
+            else
+                flight_vertical_dir = 0
+            end
+            local ky = vbar_cy + math.max(-1, math.min(1, rel)) * (FLIGHT_STICK_SIZE / 2 - 16)
+            dl_right:AddCircleFilled(imgui.ImVec2(vbar_cx, ky), 14, col_knob)
+        else
+            flight_vertical_dir = 0
+            dl_right:AddCircleFilled(imgui.ImVec2(vbar_cx, vbar_cy), 14, col_idle)
+        end
+
+        imgui.End()
+    end
+)
+
+------------------------------------------------------------
+-- ОТРИСОВКА ESP (читает только готовый кэш, ничего тяжёлого в кадре)
+------------------------------------------------------------
+
+-- пересчитывает мировую точку в экранную и сообщает, находится ли она перед камерой
+-- (convert3DCoordsToScreen может вернуть координаты "позади" камеры как валидные,
+-- поэтому дополнительно проверяем через getCamMatrix проекцию на forward-вектор)
+local function worldToScreenSigned(x, y, z, camPos, camFwd)
+    local okS, sx, sy = pcall(convert3DCoordsToScreen, x, y, z)
+    if not okS or not sx then return nil end
+
+    local dx, dy, dz = x - camPos[1], y - camPos[2], z - camPos[3]
+    local dot = dx * camFwd[1] + dy * camFwd[2] + dz * camFwd[3]
+
+    return sx, sy, dot > 0 -- true = точка перед камерой
+end
+
+-- обрезает луч (cx,cy) -> (tx,ty) по границе прямоугольника экрана, возвращает точку на краю
+local function clipToScreenEdge(cx, cy, tx, ty, sw, sh, margin)
+    margin = margin or 20
+    local minX, minY = margin, margin
+    local maxX, maxY = sw - margin, sh - margin
+
+    local dx, dy = tx - cx, ty - cy
+    if dx == 0 and dy == 0 then return cx, cy end
+
+    local tMin = math.huge
+
+    if dx ~= 0 then
+        local t1 = (minX - cx) / dx
+        local t2 = (maxX - cx) / dx
+        if t1 > 0 then tMin = math.min(tMin, t1) end
+        if t2 > 0 then tMin = math.min(tMin, t2) end
+    end
+    if dy ~= 0 then
+        local t3 = (minY - cy) / dy
+        local t4 = (maxY - cy) / dy
+        if t3 > 0 then tMin = math.min(tMin, t3) end
+        if t4 > 0 then tMin = math.min(tMin, t4) end
+    end
+
+    if tMin == math.huge then return cx, cy end
+
+    return cx + dx * tMin, cy + dy * tMin
+end
+
+-- единая функция отрисовки одного кэша
+local function draw_esp_cache(draw_list, cache, psx, psy, sw, sh, camPos, camFwd,
+                               lines_enabled, box_enabled, lines_size, color, show_name)
+    for _, obj in ipairs(cache) do
+        local sx, sy, inFront = nil, nil, true
+
+        if camPos and camFwd then
+            sx, sy, inFront = worldToScreenSigned(obj.x, obj.y, obj.z, camPos, camFwd)
+        else
+            local okS, rx, ry = pcall(convert3DCoordsToScreen, obj.x, obj.y, obj.z)
+            if okS then sx, sy = rx, ry end
+        end
+
+        if sx then
+            if inFront then
+                if box_enabled[0] then
+                    -- bounding box вокруг персонажа: высота человека ~2.1м в игровых
+                    -- единицах, масштабируем размер прямоугольника по дистанции,
+                    -- проецируя верхнюю и нижнюю точку модели на экран.
+                    local okTop, tsx, tsy = pcall(convert3DCoordsToScreen, obj.x, obj.y, obj.z + 1.05)
+                    local okBot, bsx, bsy = pcall(convert3DCoordsToScreen, obj.x, obj.y, obj.z - 1.05)
+                    if okTop and okBot and tsx and bsx then
+                        local boxHeight = math.abs(bsy - tsy)
+                        local boxWidth  = boxHeight * 0.55
+                        local left  = sx - boxWidth / 2
+                        local right = sx + boxWidth / 2
+                        local top   = tsy
+                        local bot   = bsy
+                        draw_list:AddRect(
+                            imgui.ImVec2(left, top), imgui.ImVec2(right, bot),
+                            color, 2.0, nil, lines_size[0])
+                    else
+                        draw_list:AddCircleFilled(imgui.ImVec2(sx, sy), 4.5, color)
+                    end
+                end
+                if show_name and obj.name then
+                    draw_list:AddText(imgui.ImVec2(sx + 6, sy - 7), color, obj.name)
+                end
+                if lines_enabled[0] then
+                    draw_list:AddLine(
+                        imgui.ImVec2(psx, psy), imgui.ImVec2(sx, sy),
+                        color, lines_size[0])
+                end
+            elseif lines_enabled[0] then
+                local dirX = psx - (sx - psx)
+                local dirY = psy - (sy - psy)
+                local ex, ey = clipToScreenEdge(psx, psy, dirX, dirY, sw, sh)
+                draw_list:AddLine(
+                    imgui.ImVec2(psx, psy), imgui.ImVec2(ex, ey),
+                    color, lines_size[0])
+            end
+        end
+    end
+end
+
+imgui.OnFrame(
+    function()
+        return (esp_enabled[0] and #esp_object_cache > 0)
+            or (esp_players_enabled[0] and #esp_players_cache > 0)
+            or (esp_cars_enabled[0]    and #esp_cars_cache    > 0)
+    end,
+    function()
+        local okDl, draw_list = pcall(imgui.GetForegroundDrawList)
+        if not okDl or not draw_list then return end
+
+        local okP, px, py, pz = pcall(getCharCoordinates, PLAYER_PED)
+        if not okP or type(px) ~= 'number' then return end
+
+        local okScr, psx, psy = pcall(convert3DCoordsToScreen, px, py, pz)
+        if not okScr or not psx then return end
+
+        local okRes, sw, sh = pcall(getScreenResolution)
+        if not okRes or not sw then sw, sh = 1280, 720 end
+
+        local okCam, camX, camY, camZ = pcall(getActiveCameraCoordinates)
+        local okFwd, fwdX, fwdY, fwdZ = pcall(getActiveCameraPointAt)
+        local camPos, camFwd
+        if okCam and camX and okFwd and fwdX then
+            camPos = { camX, camY, camZ }
+            local vx, vy, vz = fwdX - camX, fwdY - camY, fwdZ - camZ
+            local len = math.sqrt(vx*vx + vy*vy + vz*vz)
+            if len > 0 then camFwd = { vx/len, vy/len, vz/len } end
+        end
+
+        -- OBJECTS
+        if esp_enabled[0] and #esp_object_cache > 0 then
+            local col = imgui.ColorConvertFloat4ToU32(
+                imgui.ImVec4(esp_lines_color[0], esp_lines_color[1], esp_lines_color[2], esp_lines_color[3]))
+            draw_esp_cache(draw_list, esp_object_cache, psx, psy, sw, sh, camPos, camFwd,
+                esp_lines_enabled, esp_dot_enabled, esp_lines_size, col, false)
+        end
+
+        -- PLAYERS
+        if esp_players_enabled[0] and #esp_players_cache > 0 then
+            local col = imgui.ColorConvertFloat4ToU32(
+                imgui.ImVec4(esp_players_color[0], esp_players_color[1], esp_players_color[2], esp_players_color[3]))
+            draw_esp_cache(draw_list, esp_players_cache, psx, psy, sw, sh, camPos, camFwd,
+                esp_players_lines_enabled, esp_players_box_enabled, esp_players_lines_size, col, true)
+        end
+
+        -- CARS
+        if esp_cars_enabled[0] and #esp_cars_cache > 0 then
+            local col = imgui.ColorConvertFloat4ToU32(
+                imgui.ImVec4(esp_cars_color[0], esp_cars_color[1], esp_cars_color[2], esp_cars_color[3]))
+            draw_esp_cache(draw_list, esp_cars_cache, psx, psy, sw, sh, camPos, camFwd,
+                esp_cars_lines_enabled, esp_cars_box_enabled, esp_cars_lines_size, col, false)
+        end
+    end
+)
+
+------------------------------------------------------------
+-- ЗАПУСК
+------------------------------------------------------------
+
+function main()
+    repeat wait(0) until isSampAvailable()
+
+    sampRegisterChatCommand('axion', function()
+        main_window_state[0] = not main_window_state[0]
+    end)
+
+    while true do wait(0) end
+end
